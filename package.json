@@ -1,0 +1,51 @@
+{
+  "name": "@idea-base/mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for IDEA Base - AI-powered project management. Integrates with Claude Code, Cursor, and Windsurf.",
+  "main": "src/index.js",
+  "type": "module",
+  "bin": {
+    "idea-base-mcp": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "claude-code",
+    "cursor",
+    "windsurf",
+    "project-management",
+    "task-management",
+    "time-tracking",
+    "idea-base",
+    "ai"
+  ],
+  "author": "IDEA Management LLC <support@idea-base.us>",
+  "license": "MIT",
+  "homepage": "https://idea-base.us",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IDEAManagement/idea-base-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IDEAManagement/idea-base-mcp/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ]
+}
