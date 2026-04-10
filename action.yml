@@ -1,0 +1,76 @@
+name: 'IDEA Base Task Update'
+description: 'Automatically update IDEA Base task status and log time when PRs merge'
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'IDEA Base API key'
+    required: true
+  action:
+    description: 'Action to perform: mark_done, log_time, or auto (detects from PR)'
+    required: false
+    default: 'auto'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Process PR
+      shell: bash
+      env:
+        IDEA_BASE_API_KEY: ${{ inputs.api-key }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+        PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+        PR_MERGED: ${{ github.event.pull_request.merged }}
+        ACTION_TYPE: ${{ inputs.action }}
+      run: |
+        if [ "$PR_MERGED" != "true" ]; then
+          echo "PR not merged, skipping"
+          exit 0
+        fi
+
+        API_URL="https://app.idea-base.us/api"
+
+        # Extract task ID from PR title (matches #123 or Task #123)
+        TASK_ID=$(echo "$PR_TITLE" | grep -oP '#\K\d+' | head -1)
+
+        if [ -z "$TASK_ID" ]; then
+          echo "No task ID found in PR title. Use #123 format to link."
+          exit 0
+        fi
+
+        echo "Found task ID: $TASK_ID"
+
+        # Mark task as done
+        if [ "$ACTION_TYPE" = "auto" ] || [ "$ACTION_TYPE" = "mark_done" ]; then
+          echo "Marking task #$TASK_ID as done..."
+          curl -s -X PUT "$API_URL/tasks/$TASK_ID/status" \
+            -H "Authorization: Bearer $IDEA_BASE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"status": "done"}'
+          echo ""
+        fi
+
+        # Log time based on PR size
+        if [ "$ACTION_TYPE" = "auto" ] || [ "$ACTION_TYPE" = "log_time" ]; then
+          CHANGES=$((${PR_ADDITIONS:-0} + ${PR_DELETIONS:-0}))
+          if [ "$CHANGES" -lt 50 ]; then MINUTES=30
+          elif [ "$CHANGES" -lt 200 ]; then MINUTES=60
+          elif [ "$CHANGES" -lt 500 ]; then MINUTES=120
+          elif [ "$CHANGES" -lt 1000 ]; then MINUTES=180
+          else MINUTES=240
+          fi
+
+          echo "Logging $MINUTES minutes to task #$TASK_ID..."
+          curl -s -X POST "$API_URL/tasks/$TASK_ID/time" \
+            -H "Authorization: Bearer $IDEA_BASE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"minutes\": $MINUTES, \"notes\": \"PR merged: $PR_TITLE\"}"
+          echo ""
+        fi
+
+        echo "Done! Task #$TASK_ID updated."
