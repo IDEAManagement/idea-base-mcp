@@ -1,6 +1,6 @@
 {
   "name": "@idea-base/mcp-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "MCP Server for IDEA Base - AI-powered project management. Integrates with Claude Code, Cursor, and Windsurf.",
   "main": "src/index.js",
   "type": "module",
