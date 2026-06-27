@@ -66,7 +66,7 @@ const tools = [
   },
   {
     name: 'create_project',
-    description: 'Create a new project. Returns the created project with its ID.',
+    description: 'Create a new project. A TOP-LEVEL project requires product_id; a sub-project (parent_project_id set) inherits its parent\'s product. Returns the created project with its ID.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -80,7 +80,11 @@ const tools = [
         },
         parent_project_id: {
           type: 'number',
-          description: 'Parent project ID if this is a sub-project',
+          description: 'Parent project ID if this is a sub-project (inherits the parent\'s product)',
+        },
+        product_id: {
+          type: 'number',
+          description: 'Product this project belongs to. Required for a top-level project (no parent); omit for a sub-project. Find ids via list_products.',
         },
       },
       required: ['name'],
@@ -385,7 +389,7 @@ const tools = [
   },
   {
     name: 'create_product',
-    description: 'Create a new product. Products are top-level containers that can have multiple projects linked to them.',
+    description: 'Create a new product. Products are top-level containers for projects. Every product belongs to a customer (customer_id is required) — use an internal/own-company customer for internal work. Find customer ids via list_products (each shows its customer_id).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -401,8 +405,12 @@ const tools = [
           type: 'string',
           description: 'GitHub repository URL for the product',
         },
+        customer_id: {
+          type: 'number',
+          description: 'Customer this product is for. REQUIRED — every product belongs to a customer.',
+        },
       },
-      required: ['name'],
+      required: ['name', 'customer_id'],
     },
   },
   {
@@ -449,13 +457,14 @@ const toolHandlers = {
     };
   },
 
-  async create_project({ name, description, parent_project_id }) {
+  async create_project({ name, description, parent_project_id, product_id }) {
     const project = await apiRequest('/projects', {
       method: 'POST',
       body: JSON.stringify({
         name,
         description,
         parent_project_id,
+        product_id,
       }),
     });
     return {
@@ -721,13 +730,14 @@ const toolHandlers = {
     };
   },
 
-  async create_product({ name, description, github_repo_url }) {
+  async create_product({ name, description, github_repo_url, customer_id }) {
     const product = await apiRequest('/products', {
       method: 'POST',
       body: JSON.stringify({
         name,
         description,
         github_repo_url,
+        customer_id,
       }),
     });
     return {
