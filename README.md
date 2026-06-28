@@ -85,8 +85,18 @@ Ask Claude to manage your projects:
 | Tool | Description |
 |------|-------------|
 | `log_time` | Log time against a task with notes |
-| `start_working` | Mark yourself as actively working on a task |
-| `stop_working` | Stop active work on a task |
+| `start_working` | Mark yourself as actively working on a task (surfaces the saved resume context + recent work notes so a cold session re-orients) |
+| `stop_working` | Stop active work on a task (optionally capture a `note` and/or `resume_context` on the way out) |
+
+### Activity & Audit Trail
+
+For AI agents, these leave a durable trail of *what was done and why* on each task — so a future session (or a human reviewer) can see the reasoning, not just the final state.
+
+| Tool | Description |
+|------|-------------|
+| `add_work_note` | Append a timestamped progress note to a task's activity log (append-only journal) |
+| `add_comment` | Add a comment to a task's discussion thread (customer-visible by default) |
+| `set_resume_context` | Overwrite the task's pinned "where I left off" block, read first on `start_working` |
 
 ### Products
 
