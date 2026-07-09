@@ -194,13 +194,21 @@ const tools = [
           type: 'number',
           description: 'Priority level (0-5, higher is more important)',
         },
+        start_date: {
+          type: 'string',
+          description: 'Date work is scheduled to begin, as YYYY-MM-DD',
+        },
+        due_date: {
+          type: 'string',
+          description: 'Date the task is due, as YYYY-MM-DD. Use this instead of putting a date in the title.',
+        },
       },
       required: ['project_id', 'title'],
     },
   },
   {
     name: 'update_task',
-    description: 'Update task details like title, description, estimates, or acceptance criteria.',
+    description: 'Update task details like title, description, estimates, dates, or acceptance criteria.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -227,6 +235,14 @@ const tools = [
         priority: {
           type: 'number',
           description: 'New priority level',
+        },
+        start_date: {
+          type: 'string',
+          description: 'Date work is scheduled to begin, as YYYY-MM-DD. Pass an empty string to clear it.',
+        },
+        due_date: {
+          type: 'string',
+          description: 'Date the task is due, as YYYY-MM-DD. Pass an empty string to clear it.',
         },
       },
       required: ['task_id'],
@@ -621,7 +637,7 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date }) {
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -630,6 +646,8 @@ const toolHandlers = {
         acceptance_criteria,
         estimated_minutes,
         priority,
+        start_date,
+        due_date,
       }),
     });
     return {
@@ -642,13 +660,15 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date }) {
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (acceptance_criteria !== undefined) updates.acceptance_criteria = acceptance_criteria;
     if (estimated_minutes !== undefined) updates.estimated_minutes = estimated_minutes;
     if (priority !== undefined) updates.priority = priority;
+    if (start_date !== undefined) updates.start_date = start_date;
+    if (due_date !== undefined) updates.due_date = due_date;
 
     const task = await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
