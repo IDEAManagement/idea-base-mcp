@@ -74,8 +74,8 @@ Ask Claude to manage your projects:
 |------|-------------|
 | `list_tasks` | List tasks for a project (filter by status) |
 | `get_task` | Get task details, acceptance criteria, and time entries |
-| `create_task` | Create a task with title, description, estimate |
-| `update_task` | Update task details |
+| `create_task` | Create a task with title, description, estimate, priority, start/due dates, assignee |
+| `update_task` | Update task details, priority, start/due dates, assignee |
 | `update_task_status` | Change task status (todo/in_progress/done) |
 | `search_tasks` | Search tasks across all projects |
 | `quick_log` | Create + complete + log time in one step |
