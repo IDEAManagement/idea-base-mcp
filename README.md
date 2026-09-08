@@ -72,12 +72,12 @@ Ask Claude to manage your projects:
 
 | Tool | Description |
 |------|-------------|
-| `list_tasks` | List tasks for a project (filter by status) |
+| `list_tasks` | List tasks for a project (filter by status). Compact rows by default (`verbose:true` for full rows) |
 | `get_task` | Get task details, acceptance criteria, and time entries |
 | `create_task` | Create a task with title, description, estimate |
 | `update_task` | Update task details |
 | `update_task_status` | Change task status (todo/in_progress/done) |
-| `search_tasks` | Search tasks across all projects |
+| `search_tasks` | Search tasks across all projects, ranked title-first then description then recency. Compact rows by default; filter by `project_id`/`product_id`/`customer_id`/`status`; `verbose:true` for full rows |
 | `quick_log` | Create + complete + log time in one step |
 
 ### Time Tracking
