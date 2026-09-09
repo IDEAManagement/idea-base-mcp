@@ -44,6 +44,32 @@ async function apiRequest(endpoint, options = {}) {
   return response.json();
 }
 
+// Build a short description snippet (first ~160 chars) for compact task rows
+// returned by list_tasks when the API response doesn't already provide one
+// (i.e. the plain /projects/:id/tasks endpoint, which is not the compacted
+// tasks/search endpoint).
+function snippetFor(description, maxLen = 160) {
+  if (!description) return '';
+  const trimmed = description.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return trimmed.slice(0, maxLen).trim() + '…';
+}
+
+// Reduce a full task row (as returned by /projects/:id/tasks) down to the
+// compact shape used by list_tasks when verbose is not requested.
+function compactifyTask(task) {
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+    priority: task.priority,
+    estimated_minutes: task.estimated_minutes,
+    time_spent: task.time_spent,
+    due_date: task.due_date,
+    snippet: snippetFor(task.description),
+  };
+}
+
 // Define available tools
 const tools = [
   {
@@ -133,7 +159,7 @@ const tools = [
   },
   {
     name: 'list_tasks',
-    description: 'List all tasks for a specific project. Returns task titles, status, estimates, and time logged.',
+    description: 'List all tasks for a specific project. Returns compact rows (id, title, status, priority, estimated_minutes, time_spent, due_date, snippet) by default to keep payloads small; pass verbose:true for full rows including description, acceptance_criteria, tags, and assignments.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -145,6 +171,10 @@ const tools = [
           type: 'string',
           enum: ['todo', 'in_progress', 'done'],
           description: 'Filter by task status. Omit for all tasks.',
+        },
+        verbose: {
+          type: 'boolean',
+          description: 'Return full task rows (description, acceptance_criteria, tags, assignments) instead of compact rows. Default false.',
         },
       },
       required: ['project_id'],
@@ -303,7 +333,7 @@ const tools = [
   },
   {
     name: 'search_tasks',
-    description: 'Search for tasks across all projects by title or description.',
+    description: 'Search for tasks across all projects by title or description. Returns compact rows (id, title, status, priority, project_id, project_name, product_name, customer_name, estimated_minutes, time_logged, due_date, snippet) ranked with title matches first, then description matches, then recency. Pass verbose:true for full rows.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -315,6 +345,26 @@ const tools = [
           type: 'string',
           enum: ['todo', 'in_progress', 'done'],
           description: 'Filter results by status',
+        },
+        project_id: {
+          type: 'number',
+          description: 'Restrict results to this project',
+        },
+        product_id: {
+          type: 'number',
+          description: 'Restrict results to this product',
+        },
+        customer_id: {
+          type: 'number',
+          description: 'Restrict results to this customer',
+        },
+        verbose: {
+          type: 'boolean',
+          description: 'Return full task rows instead of compact rows. Default false.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results to return. Default 20, capped at 100.',
         },
       },
       required: ['query'],
@@ -618,16 +668,17 @@ const toolHandlers = {
     };
   },
 
-  async list_tasks({ project_id, status }) {
+  async list_tasks({ project_id, status, verbose }) {
     let endpoint = `/projects/${project_id}/tasks`;
     if (status) endpoint += `?status=${status}`;
 
     const tasks = await apiRequest(endpoint);
+    const result = verbose ? tasks : (Array.isArray(tasks) ? tasks.map(compactifyTask) : tasks);
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(tasks, null, 2),
+          text: JSON.stringify(result, null, 2),
         },
       ],
     };
@@ -731,9 +782,14 @@ const toolHandlers = {
     };
   },
 
-  async search_tasks({ query, status }) {
+  async search_tasks({ query, status, project_id, product_id, customer_id, verbose, limit }) {
     let endpoint = `/tasks/search?q=${encodeURIComponent(query)}`;
     if (status) endpoint += `&status=${status}`;
+    if (project_id) endpoint += `&project_id=${project_id}`;
+    if (product_id) endpoint += `&product_id=${product_id}`;
+    if (customer_id) endpoint += `&customer_id=${customer_id}`;
+    if (verbose) endpoint += `&verbose=1`;
+    if (limit) endpoint += `&limit=${limit}`;
 
     const tasks = await apiRequest(endpoint);
     return {
