@@ -44,6 +44,32 @@ async function apiRequest(endpoint, options = {}) {
   return response.json();
 }
 
+// Build a short description snippet (first ~160 chars) for compact task rows
+// returned by list_tasks when the API response doesn't already provide one
+// (i.e. the plain /projects/:id/tasks endpoint, which is not the compacted
+// tasks/search endpoint).
+function snippetFor(description, maxLen = 160) {
+  if (!description) return '';
+  const trimmed = description.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return trimmed.slice(0, maxLen).trim() + '…';
+}
+
+// Reduce a full task row (as returned by /projects/:id/tasks) down to the
+// compact shape used by list_tasks when verbose is not requested.
+function compactifyTask(task) {
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+    priority: task.priority,
+    estimated_minutes: task.estimated_minutes,
+    time_spent: task.time_spent,
+    due_date: task.due_date,
+    snippet: snippetFor(task.description),
+  };
+}
+
 // Define available tools
 const tools = [
   {
@@ -133,7 +159,7 @@ const tools = [
   },
   {
     name: 'list_tasks',
-    description: 'List all tasks for a specific project. Returns task titles, status, estimates, and time logged.',
+    description: 'List all tasks for a specific project. Returns compact rows (id, title, status, priority, estimated_minutes, time_spent, due_date, snippet) by default to keep payloads small; pass verbose:true for full rows including description, acceptance_criteria, tags, and assignments.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -145,6 +171,10 @@ const tools = [
           type: 'string',
           enum: ['todo', 'in_progress', 'blocked', 'done'],
           description: 'Filter by task status. Omit for all tasks. Note this filters the STORED status; a task can also be showing as blocked because of an unmet dependency (see effective_status on each row).',
+        },
+        verbose: {
+          type: 'boolean',
+          description: 'Return full task rows (description, acceptance_criteria, tags, assignments) instead of compact rows. Default false.',
         },
       },
       required: ['project_id'],
@@ -194,6 +224,18 @@ const tools = [
           type: 'number',
           description: 'Priority level (0-5, higher is more important)',
         },
+        start_date: {
+          type: 'string',
+          description: 'Date work is planned to start, as YYYY-MM-DD.',
+        },
+        due_date: {
+          type: 'string',
+          description: 'Date the task is due, as YYYY-MM-DD.',
+        },
+        assignee_user_id: {
+          type: 'string',
+          description: 'User ID to assign the task to. Must be a member of the same account. Omit to leave the task unassigned.',
+        },
         parent_task_id: {
           type: 'number',
           description: 'Make this a SUBTASK of the given task. The parent must be in the same project, and a subtask cannot itself have subtasks (one level only). A parent with subtasks takes its status from them: any subtask in progress makes the parent in progress, and all subtasks done makes it ready to complete.',
@@ -230,7 +272,19 @@ const tools = [
         },
         priority: {
           type: 'number',
-          description: 'New priority level',
+          description: 'New priority level (0-5, higher is more important)',
+        },
+        start_date: {
+          type: 'string',
+          description: 'New start date as YYYY-MM-DD. Pass an empty string to clear it.',
+        },
+        due_date: {
+          type: 'string',
+          description: 'New due date as YYYY-MM-DD. Pass an empty string to clear it.',
+        },
+        assignee_user_id: {
+          type: 'string',
+          description: 'User ID to assign the task to, replacing any existing assignee. Must be a member of the same account. Pass an empty string to unassign.',
         },
         blocked_by: {
           type: 'array',
@@ -296,7 +350,7 @@ const tools = [
   },
   {
     name: 'search_tasks',
-    description: 'Search for tasks across all projects by title or description.',
+    description: 'Search for tasks across all projects by title or description. Returns compact rows (id, title, status, priority, project_id, project_name, product_name, customer_name, estimated_minutes, time_logged, due_date, snippet) ranked with title matches first, then description matches, then recency. Pass verbose:true for full rows.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -308,6 +362,26 @@ const tools = [
           type: 'string',
           enum: ['todo', 'in_progress', 'blocked', 'done'],
           description: 'Filter results by status',
+        },
+        project_id: {
+          type: 'number',
+          description: 'Restrict results to this project',
+        },
+        product_id: {
+          type: 'number',
+          description: 'Restrict results to this product',
+        },
+        customer_id: {
+          type: 'number',
+          description: 'Restrict results to this customer',
+        },
+        verbose: {
+          type: 'boolean',
+          description: 'Return full task rows instead of compact rows. Default false.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results to return. Default 20, capped at 100.',
         },
       },
       required: ['query'],
@@ -611,16 +685,17 @@ const toolHandlers = {
     };
   },
 
-  async list_tasks({ project_id, status }) {
+  async list_tasks({ project_id, status, verbose }) {
     let endpoint = `/projects/${project_id}/tasks`;
     if (status) endpoint += `?status=${status}`;
 
     const tasks = await apiRequest(endpoint);
+    const result = verbose ? tasks : (Array.isArray(tasks) ? tasks.map(compactifyTask) : tasks);
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(tasks, null, 2),
+          text: JSON.stringify(result, null, 2),
         },
       ],
     };
@@ -638,7 +713,7 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, parent_task_id }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id }) {
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -647,6 +722,9 @@ const toolHandlers = {
         acceptance_criteria,
         estimated_minutes,
         priority,
+        start_date,
+        due_date,
+        assignee_user_id,
         parent_task_id,
       }),
     });
@@ -660,15 +738,20 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, blocked_by, blocked_reason }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason }) {
+    // Only forward what the caller actually named. An absent key leaves the
+    // field alone; an explicitly empty string is how a date or the assignee is
+    // cleared, and blocked_by is a REPLACE so an explicit [] must reach the
+    // API — which is why these are `!== undefined` rather than truthiness.
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (acceptance_criteria !== undefined) updates.acceptance_criteria = acceptance_criteria;
     if (estimated_minutes !== undefined) updates.estimated_minutes = estimated_minutes;
     if (priority !== undefined) updates.priority = priority;
-    // blocked_by is a REPLACE, so an explicit [] must reach the API — hence the
-    // `!== undefined` check rather than a truthiness one.
+    if (start_date !== undefined) updates.start_date = start_date;
+    if (due_date !== undefined) updates.due_date = due_date;
+    if (assignee_user_id !== undefined) updates.assignee_user_id = assignee_user_id;
     if (blocked_by !== undefined) updates.blocked_by = blocked_by;
     if (blocked_reason !== undefined) updates.blocked_reason = blocked_reason;
 
@@ -720,9 +803,14 @@ const toolHandlers = {
     };
   },
 
-  async search_tasks({ query, status }) {
+  async search_tasks({ query, status, project_id, product_id, customer_id, verbose, limit }) {
     let endpoint = `/tasks/search?q=${encodeURIComponent(query)}`;
     if (status) endpoint += `&status=${status}`;
+    if (project_id) endpoint += `&project_id=${project_id}`;
+    if (product_id) endpoint += `&product_id=${product_id}`;
+    if (customer_id) endpoint += `&customer_id=${customer_id}`;
+    if (verbose) endpoint += `&verbose=1`;
+    if (limit) endpoint += `&limit=${limit}`;
 
     const tasks = await apiRequest(endpoint);
     return {
