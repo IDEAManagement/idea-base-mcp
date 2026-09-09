@@ -74,9 +74,9 @@ Ask Claude to manage your projects:
 |------|-------------|
 | `list_tasks` | List tasks for a project (filter by status) |
 | `get_task` | Get task details, acceptance criteria, and time entries |
-| `create_task` | Create a task with title, description, estimate |
-| `update_task` | Update task details |
-| `update_task_status` | Change task status (todo/in_progress/done) |
+| `create_task` | Create a task with title, description, estimate; `parent_task_id` makes it a subtask |
+| `update_task` | Update task details; `blocked_by: [ids]` replaces its dependencies |
+| `update_task_status` | Change task status (todo/in_progress/blocked/done) |
 | `search_tasks` | Search tasks across all projects |
 | `quick_log` | Create + complete + log time in one step |
 

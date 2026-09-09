@@ -143,8 +143,8 @@ const tools = [
         },
         status: {
           type: 'string',
-          enum: ['todo', 'in_progress', 'done'],
-          description: 'Filter by task status. Omit for all tasks.',
+          enum: ['todo', 'in_progress', 'blocked', 'done'],
+          description: 'Filter by task status. Omit for all tasks. Note this filters the STORED status; a task can also be showing as blocked because of an unmet dependency (see effective_status on each row).',
         },
       },
       required: ['project_id'],
@@ -194,6 +194,10 @@ const tools = [
           type: 'number',
           description: 'Priority level (0-5, higher is more important)',
         },
+        parent_task_id: {
+          type: 'number',
+          description: 'Make this a SUBTASK of the given task. The parent must be in the same project, and a subtask cannot itself have subtasks (one level only). A parent with subtasks takes its status from them: any subtask in progress makes the parent in progress, and all subtasks done makes it ready to complete.',
+        },
       },
       required: ['project_id', 'title'],
     },
@@ -228,13 +232,22 @@ const tools = [
           type: 'number',
           description: 'New priority level',
         },
+        blocked_by: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'REPLACES the full set of tasks this task is blocked by. Pass [] to clear all of them. Every id must be a task in the same product; a circular chain (A blocked by B blocked by A) is rejected. While any of these is not done, the task shows as blocked whatever its stored status says.',
+        },
+        blocked_reason: {
+          type: 'string',
+          description: 'Free-text reason shown next to a manually-set Blocked status ("waiting on the client"). Cleared automatically when the task leaves the blocked status.',
+        },
       },
       required: ['task_id'],
     },
   },
   {
     name: 'update_task_status',
-    description: 'Change the status of a task (todo, in_progress, done). This triggers a real-time notification to users viewing the project.',
+    description: 'Change the status of a task (todo, in_progress, blocked, done). This triggers a real-time notification to users viewing the project. Note that a task with subtasks or dependencies also has a DERIVED status which can differ from the one set here — see effective_status / status_reason on get_task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -244,8 +257,12 @@ const tools = [
         },
         status: {
           type: 'string',
-          enum: ['todo', 'in_progress', 'done'],
-          description: 'New status for the task',
+          enum: ['todo', 'in_progress', 'blocked', 'done'],
+          description: 'New status for the task. "ready_to_complete" is NOT settable — it is derived when every subtask is done.',
+        },
+        blocked_reason: {
+          type: 'string',
+          description: 'Why the task is blocked. Only meaningful with status "blocked"; cleared automatically on any other status.',
         },
       },
       required: ['task_id', 'status'],
@@ -289,7 +306,7 @@ const tools = [
         },
         status: {
           type: 'string',
-          enum: ['todo', 'in_progress', 'done'],
+          enum: ['todo', 'in_progress', 'blocked', 'done'],
           description: 'Filter results by status',
         },
       },
@@ -621,7 +638,7 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, parent_task_id }) {
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -630,6 +647,7 @@ const toolHandlers = {
         acceptance_criteria,
         estimated_minutes,
         priority,
+        parent_task_id,
       }),
     });
     return {
@@ -642,13 +660,17 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, blocked_by, blocked_reason }) {
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (acceptance_criteria !== undefined) updates.acceptance_criteria = acceptance_criteria;
     if (estimated_minutes !== undefined) updates.estimated_minutes = estimated_minutes;
     if (priority !== undefined) updates.priority = priority;
+    // blocked_by is a REPLACE, so an explicit [] must reach the API — hence the
+    // `!== undefined` check rather than a truthiness one.
+    if (blocked_by !== undefined) updates.blocked_by = blocked_by;
+    if (blocked_reason !== undefined) updates.blocked_reason = blocked_reason;
 
     const task = await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
@@ -664,10 +686,10 @@ const toolHandlers = {
     };
   },
 
-  async update_task_status({ task_id, status }) {
+  async update_task_status({ task_id, status, blocked_reason }) {
     const task = await apiRequest(`/tasks/${task_id}/status`, {
       method: 'PUT',
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ status, blocked_reason }),
     });
     return {
       content: [
