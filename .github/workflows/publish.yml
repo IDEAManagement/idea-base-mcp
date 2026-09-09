@@ -4,6 +4,8 @@ on:
   release:
     types: [published]
 
+# Least privilege: id-token for the npm Trusted Publisher OIDC exchange,
+# contents:read to check out the tag. Nothing else.
 permissions:
   id-token: write
   contents: read
@@ -14,10 +16,14 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
+      # Actions pinned to full commit SHAs so a moved tag cannot change what runs.
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -25,8 +31,25 @@ jobs:
       - name: Check npm version
         run: npm --version
 
+      - name: Verify package version matches the release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "$RELEASE_TAG" ]; then
+            echo "Refusing to publish: package.json is $PKG_VERSION but the release tag is $RELEASE_TAG"
+            exit 1
+          fi
+          echo "Publishing $PKG_VERSION"
+
       - name: Install dependencies
         run: npm ci
+
+      # Informational: surfaces advisories in the run log without turning a new
+      # transitive CVE into a release outage.
+      - name: Audit runtime dependencies
+        continue-on-error: true
+        run: npm audit --omit=dev
 
       - name: Publish to npm
         run: npm publish --provenance --access public

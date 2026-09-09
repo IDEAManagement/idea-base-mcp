@@ -37,14 +37,14 @@
     "url": "https://github.com/IDEAManagement/idea-base-mcp/issues"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "publishConfig": {
     "access": "public",
     "provenance": true
   },
   "files": [
-    "src/",
+    "src/index.js",
     "README.md",
     "LICENSE"
   ]
