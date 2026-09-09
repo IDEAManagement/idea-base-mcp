@@ -194,6 +194,18 @@ const tools = [
           type: 'number',
           description: 'Priority level (0-5, higher is more important)',
         },
+        start_date: {
+          type: 'string',
+          description: 'Date work is planned to start, as YYYY-MM-DD.',
+        },
+        due_date: {
+          type: 'string',
+          description: 'Date the task is due, as YYYY-MM-DD.',
+        },
+        assignee_user_id: {
+          type: 'string',
+          description: 'User ID to assign the task to. Must be a member of the same account. Omit to leave the task unassigned.',
+        },
       },
       required: ['project_id', 'title'],
     },
@@ -226,7 +238,19 @@ const tools = [
         },
         priority: {
           type: 'number',
-          description: 'New priority level',
+          description: 'New priority level (0-5, higher is more important)',
+        },
+        start_date: {
+          type: 'string',
+          description: 'New start date as YYYY-MM-DD. Pass an empty string to clear it.',
+        },
+        due_date: {
+          type: 'string',
+          description: 'New due date as YYYY-MM-DD. Pass an empty string to clear it.',
+        },
+        assignee_user_id: {
+          type: 'string',
+          description: 'User ID to assign the task to, replacing any existing assignee. Must be a member of the same account. Pass an empty string to unassign.',
         },
       },
       required: ['task_id'],
@@ -621,7 +645,7 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id }) {
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -630,6 +654,9 @@ const toolHandlers = {
         acceptance_criteria,
         estimated_minutes,
         priority,
+        start_date,
+        due_date,
+        assignee_user_id,
       }),
     });
     return {
@@ -642,13 +669,19 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id }) {
+    // Only forward what the caller actually named. An absent key leaves the
+    // field alone; an explicitly empty string is how a date or the assignee is
+    // cleared, which is why these are `!== undefined` rather than truthiness.
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (acceptance_criteria !== undefined) updates.acceptance_criteria = acceptance_criteria;
     if (estimated_minutes !== undefined) updates.estimated_minutes = estimated_minutes;
     if (priority !== undefined) updates.priority = priority;
+    if (start_date !== undefined) updates.start_date = start_date;
+    if (due_date !== undefined) updates.due_date = due_date;
+    if (assignee_user_id !== undefined) updates.assignee_user_id = assignee_user_id;
 
     const task = await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
