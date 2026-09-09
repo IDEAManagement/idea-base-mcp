@@ -15,33 +15,218 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-// Configuration from environment
-const API_BASE_URL = process.env.IDEA_BASE_API_URL || 'https://app.idea-base.us/api';
-const API_KEY = process.env.IDEA_BASE_API_KEY;
+// ---------------------------------------------------------------------------
+// Configuration
+//
+// The API key comes from the environment and nowhere else: it is never a tool
+// argument, never logged, and never allowed into an error message or a tool
+// result (see redact() below). The base URL is a constant unless the operator
+// deliberately overrides it, and an override must still be https.
+// ---------------------------------------------------------------------------
+const DEFAULT_API_BASE_URL = 'https://app.idea-base.us/api';
+
+function resolveBaseUrl() {
+  const override = (process.env.IDEA_BASE_API_URL || '').trim();
+  if (!override) return DEFAULT_API_BASE_URL;
+
+  let parsed;
+  try {
+    parsed = new URL(override);
+  } catch {
+    console.error('Error: IDEA_BASE_API_URL is not a valid URL');
+    process.exit(1);
+  }
+  if (parsed.protocol !== 'https:') {
+    console.error('Error: IDEA_BASE_API_URL must use https');
+    process.exit(1);
+  }
+  if (parsed.username || parsed.password) {
+    console.error('Error: IDEA_BASE_API_URL must not embed credentials');
+    process.exit(1);
+  }
+  // Announce a non-default host once at startup so a poisoned environment is
+  // visible in the client log rather than silently exfiltrating the API key.
+  console.error(`IDEA Base MCP: API host overridden to ${parsed.host} via IDEA_BASE_API_URL`);
+  return override.replace(/\/+$/, '');
+}
+
+const API_BASE_URL = resolveBaseUrl();
+const API_KEY = (process.env.IDEA_BASE_API_KEY || '').trim();
 
 if (!API_KEY) {
   console.error('Error: IDEA_BASE_API_KEY environment variable is required');
   process.exit(1);
 }
 
-// API helper function
-async function apiRequest(endpoint, options = {}) {
-  const url = `${API_BASE_URL}${endpoint}`;
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${API_KEY}`,
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  });
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_ERROR_CHARS = 300;
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(error.error || `API error: ${response.status}`);
+// Belt-and-braces: nothing we emit should ever contain the key, but a stray
+// stack frame or an echoing upstream must not be the thing that proves it.
+function redact(text) {
+  if (typeof text !== 'string') return '';
+  return API_KEY ? text.split(API_KEY).join('[redacted]') : text;
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation
+//
+// Tool arguments arrive from a model and must never be able to steer the host
+// or the path. Every argument is checked against the tool's own inputSchema
+// before a handler runs: unknown keys are dropped, ids must be positive
+// integers, enums must match, strings are length-capped.
+// ---------------------------------------------------------------------------
+const MAX_STRING_LEN = 20000;
+const STRING_LIMITS = { query: 500, date: 32, start_date: 32, due_date: 32 };
+
+function validateArgs(toolName, schema, rawArgs) {
+  const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
+  const props = schema?.properties || {};
+  const clean = {};
+
+  for (const name of schema?.required || []) {
+    if (args[name] === undefined || args[name] === null || args[name] === '') {
+      throw new Error(`${toolName}: "${name}" is required`);
+    }
   }
 
-  return response.json();
+  for (const [name, value] of Object.entries(args)) {
+    const spec = props[name];
+    if (!spec) continue; // drop anything the tool does not declare
+    if (value === undefined || value === null) continue;
+    clean[name] = coerce(toolName, name, spec, value);
+  }
+
+  return clean;
+}
+
+function coerce(toolName, name, spec, value) {
+  const label = `${toolName}: "${name}"`;
+
+  if (spec.type === 'number' || spec.type === 'integer') {
+    const n = typeof value === 'number' ? value : Number(String(value).trim());
+    if (!Number.isFinite(n)) throw new Error(`${label} must be a number`);
+    if (name === 'id' || name.endsWith('_id')) {
+      if (!Number.isInteger(n) || n <= 0 || n > Number.MAX_SAFE_INTEGER) {
+        throw new Error(`${label} must be a positive integer id`);
+      }
+    }
+    return n;
+  }
+
+  if (spec.type === 'boolean') return Boolean(value);
+
+  if (spec.type === 'array') {
+    if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+    if (value.length > 500) throw new Error(`${label} has too many entries (max 500)`);
+    return value.map((item, i) => coerce(toolName, `${name}[${i}]`, spec.items || {}, item));
+  }
+
+  // string (and anything unspecified)
+  const str = typeof value === 'string' ? value : String(value);
+  if (spec.enum && !spec.enum.includes(str)) {
+    throw new Error(`${label} must be one of: ${spec.enum.join(', ')}`);
+  }
+  const max = STRING_LIMITS[name] ?? MAX_STRING_LEN;
+  if (str.length > max) throw new Error(`${label} is too long (max ${max} characters)`);
+  return str;
+}
+
+// ---------------------------------------------------------------------------
+// API helper
+// ---------------------------------------------------------------------------
+async function readCapped(response) {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    throw new Error('API response exceeded the 5 MB size cap');
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) return '';
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new Error('API response exceeded the 5 MB size cap');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+// The API serves an HTML shell for some unknown paths. Never let that body
+// reach the model — report the shape of what came back instead.
+function parseJsonBody(text, response) {
+  const contentType = (response.headers.get('content-type') || '').split(';')[0].trim();
+  if (!contentType.includes('json')) {
+    throw new Error(
+      `API returned ${response.status} as ${contentType || 'an unknown content type'} rather than JSON` +
+      ' (the endpoint may not exist)'
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`API returned ${response.status} with a malformed JSON body`);
+  }
+}
+
+async function apiRequest(endpoint, options = {}) {
+  const url = `${API_BASE_URL}${endpoint}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      // A redirect could carry the Authorization header somewhere else. There
+      // is no legitimate redirect on this API, so refuse rather than follow.
+      redirect: 'error',
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Bearer ${API_KEY}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...options.headers,
+      },
+    });
+  } catch (error) {
+    clearTimeout(timer);
+    if (error?.name === 'AbortError') {
+      throw new Error(`API request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw new Error(`API request failed: ${redact(error?.message || 'network error')}`);
+  }
+
+  let text;
+  try {
+    text = await readCapped(response);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    let message = `API error: ${response.status}`;
+    const contentType = (response.headers.get('content-type') || '');
+    if (contentType.includes('json')) {
+      try {
+        const body = JSON.parse(text);
+        if (typeof body?.error === 'string' && body.error) {
+          message = body.error.slice(0, MAX_ERROR_CHARS);
+        }
+      } catch {
+        // fall through to the generic status message
+      }
+    }
+    throw new Error(redact(message));
+  }
+
+  return parseJsonBody(text, response);
 }
 
 // Build a short description snippet (first ~160 chars) for compact task rows
@@ -687,7 +872,7 @@ const toolHandlers = {
 
   async list_tasks({ project_id, status, verbose }) {
     let endpoint = `/projects/${project_id}/tasks`;
-    if (status) endpoint += `?status=${status}`;
+    if (status) endpoint += `?status=${encodeURIComponent(status)}`;
 
     const tasks = await apiRequest(endpoint);
     const result = verbose ? tasks : (Array.isArray(tasks) ? tasks.map(compactifyTask) : tasks);
@@ -805,12 +990,12 @@ const toolHandlers = {
 
   async search_tasks({ query, status, project_id, product_id, customer_id, verbose, limit }) {
     let endpoint = `/tasks/search?q=${encodeURIComponent(query)}`;
-    if (status) endpoint += `&status=${status}`;
-    if (project_id) endpoint += `&project_id=${project_id}`;
-    if (product_id) endpoint += `&product_id=${product_id}`;
-    if (customer_id) endpoint += `&customer_id=${customer_id}`;
+    if (status) endpoint += `&status=${encodeURIComponent(status)}`;
+    if (project_id) endpoint += `&project_id=${encodeURIComponent(project_id)}`;
+    if (product_id) endpoint += `&product_id=${encodeURIComponent(product_id)}`;
+    if (customer_id) endpoint += `&customer_id=${encodeURIComponent(customer_id)}`;
     if (verbose) endpoint += `&verbose=1`;
-    if (limit) endpoint += `&limit=${limit}`;
+    if (limit) endpoint += `&limit=${encodeURIComponent(limit)}`;
 
     const tasks = await apiRequest(endpoint);
     return {
@@ -990,7 +1175,7 @@ const toolHandlers = {
   // Products handlers
   async list_products({ status }) {
     let endpoint = '/products';
-    if (status) endpoint += `?status=${status}`;
+    if (status) endpoint += `?status=${encodeURIComponent(status)}`;
 
     const products = await apiRequest(endpoint);
     return {
@@ -1077,18 +1262,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   const handler = toolHandlers[name];
-  if (!handler) {
+  const tool = tools.find((t) => t.name === name);
+  if (!handler || !tool) {
     throw new Error(`Unknown tool: ${name}`);
   }
 
   try {
-    return await handler(args);
+    const safeArgs = validateArgs(name, tool.inputSchema, args);
+    return await handler(safeArgs);
   } catch (error) {
     return {
       content: [
         {
           type: 'text',
-          text: `Error: ${error.message}`,
+          text: `Error: ${redact(error?.message || 'unknown error')}`,
         },
       ],
       isError: true,
@@ -1104,6 +1291,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error('Fatal error:', error);
+  console.error(`Fatal error: ${redact(error?.message || 'unknown error')}`);
   process.exit(1);
 });
