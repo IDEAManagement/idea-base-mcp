@@ -1,0 +1,28 @@
+{
+  "name": "idea-base",
+  "version": "1.3.0",
+  "description": "Keep your project tracker true to the work. IDEA Base records task status, time and context from the coding session itself, so the board reflects what was actually built rather than what someone remembered to update.",
+  "author": {
+    "name": "IDEA Management LLC",
+    "url": "https://idea-base.us"
+  },
+  "homepage": "https://idea-base.us",
+  "repository": "https://github.com/IDEAManagement/idea-base-mcp",
+  "license": "MIT",
+  "keywords": [
+    "project-management",
+    "task-tracking",
+    "time-tracking",
+    "service-desk",
+    "issue-tracking"
+  ],
+  "mcpServers": {
+    "idea-base": {
+      "command": "npx",
+      "args": ["-y", "@idea-base/mcp-server"],
+      "env": {
+        "IDEA_BASE_API_KEY": "${IDEA_BASE_API_KEY}"
+      }
+    }
+  }
+}
