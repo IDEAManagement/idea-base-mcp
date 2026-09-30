@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.1.0 — 2026-09-30
+
+Additive. Five fields and three tools the REST API already accepted and this
+server silently dropped. Nothing removed, nothing renamed — a 2.0.0 client keeps
+working unchanged.
+
+### Added
+
+- **`verification_mode` on `create_task` and `update_task`** (`manual` |
+  `ai_review` | `ci_required` | `all`). This arms the server-side gate that
+  `PUT /api/tasks/:id/status` enforces when a task is marked done. Until now the
+  only path that could arm it was the web UI, so the gate had never fired for an
+  agent. Rejected at the tool schema as an enum — note that the REST API itself
+  performs no validation and will store any string, tracked as idea-base 990455.
+- **`github_pr_url` on `create_task` and `update_task`.** A join key, not a
+  display field: the CI-status webhook and `POST /api/tasks/:id/verify` both read
+  it, and neither had input from an agent path. An empty string clears it,
+  matching REST. `github_pr_id` is deliberately NOT wired — nothing joins on it
+  and neither REST handler accepts it; wiring it would add a second,
+  unsynchronised PR pointer.
+- **`required_ci_checks`, `sort_order` and `is_milestone`** on both handlers.
+  Note that the REST *create* endpoint accepts none of these three, so passing
+  them to `create_task` is a no-op there — each field's description says so, and
+  callers must follow up with `update_task`.
+- **`verify_task`** — runs the product's AI verification, which grades a task's
+  acceptance criteria and persists `ai_completion_score`. An agent could
+  previously arm a gate it had no way to satisfy: set `ai_review`, attempt to
+  close, get 403, and be stuck. **This call costs AI credits** (2 per call), and
+  it grades the DIFF rather than the running system — both stated in the tool's
+  own description.
+- **`record_verification_feedback`** — records whether a verification verdict was
+  useful. No model call, no cost; it is the calibration data that lets the
+  verification prompt improve.
+- **`add_assignee` / `remove_assignee`** — a task may now hold more than one
+  assignee over MCP. `assignee_user_id` replaced the whole set, so a second
+  assignment silently removed the first. Granular add/remove rather than an
+  array replace-set, because the REST layer has only upsert-one and delete-one:
+  a replace-set would need N non-transactional calls with no rollback.
+  `add_assignee` no-ops when the user is already assigned, which matters because
+  a blind re-POST would submit `is_active=0` and stop a running work timer.
+
 ## 2.0.0 — 2026-09-30
 
 Major version because `author_kind` stops being an accepted input. See the app's
