@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Timed work sessions.** `start_working` now opens a `work_sessions` row with a
+  UTC start instant and `stop_working` closes it with a UTC end instant, so how
+  long a task was actually worked is measured rather than guessed. Previously the
+  pair only flipped a presence flag (`task_assignments.is_active`) and wrote
+  unmatched `started_working` / `stopped_working` audit events — 96 starts against
+  24 stops, with no duration derivable from either.
+- **`pause_working` and `resume_working`**, as separate tools rather than
+  parameters on the existing pair. A pause keeps the session open and records
+  both its boundaries plus a required `reason`, and the reason carries the whole
+  meaning: `waiting_on_human` EXCLUDES the interval from worked time,
+  `waiting_on_agent` and `other` INCLUDE it. A sub-agent blocked on another
+  active sub-agent is still working; only waiting on the human is not.
+- `start_working` called twice on one task by one actor no longer opens a second
+  session: it resumes a paused one or reports the running one, and says which.
+  The database enforces this too (a partial unique index on the open row).
+
+### Changed
+
+- `stop_working` FAILS when there is no open session, rather than reporting a
+  stop that measured nothing. Nothing is written and the active-work flag is left
+  alone.
+- Both tools keep everything they already did — the presence flag, the
+  `started_working` / `stopped_working` audit events, the todo -> in_progress
+  promotion, and `start_working`'s orientation block (resume context + recent
+  work notes) are unchanged. The session timing sits alongside them.
+- API errors now carry the endpoint's `code` and HTTP status on the thrown
+  `Error`, so a handler can tell a real answer ("you have no open session") from
+  an infrastructure failure without string-matching prose.
+
 ## 2.1.0 — 2026-09-30
 
 Additive. Five fields and three tools the REST API already accepted and this
