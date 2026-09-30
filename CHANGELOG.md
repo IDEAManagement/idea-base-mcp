@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.0.0 — 2026-09-30
+
+Major version because `author_kind` stops being an accepted input. See the app's
+`docs/architecture/actor-attribution.md` for the design this implements.
+
+### Breaking
+
+- **`author_kind` is removed from `add_work_note`, `add_comment` and
+  `set_resume_context`.** It was a free-text claim, never checked against who
+  authenticated, and was demonstrably wrong in both directions — work genuinely done
+  by the agent was labelled `human`, and notes authored under the owner's session were
+  labelled `ai`. The value is now derived server-side from the validated agent
+  identity, so there is nothing left to declare. Arguments are dropped by schema
+  validation, so a caller still sending it is ignored rather than errored; the field
+  is gone from the schemas, which is what the major bump announces. Older builds of
+  this server keep working against the new API — they simply send a field it no longer
+  reads. (idea-base#271)
+
+### Added
+
+- **`X-On-Behalf-Of` on every request.** The server now declares which agent is
+  acting, so work an agent does is attributed to the agent instead of silently
+  recorded as the API key's owner. Sent from the single `apiRequest` chokepoint, so
+  every tool inherits it.
+
+  The header **grants nothing** — no permission, no delegation, no elevation.
+  Authorization stays entirely with the API key and its owner. It answers "who did
+  this?" and only that.
+
+  Defaults to `claude_ai`; override per session with `IDEA_BASE_AGENT_ID`. The
+  identity must already exist server-side as a non-human user, or every call fails
+  closed with `403 AGENT_IDENTITY_NOT_RESOLVABLE` / `AGENT_IDENTITY_NOT_PERMITTED` —
+  deliberately loud, never a silent fallback to the key owner.
+
+  Why it matters: an agent recorded as the owner made the owner the actor of his own
+  notifications, and the notification fan-out correctly excludes the actor. The
+  account owner received no product-generated alert from 2026-09-19 until this
+  shipped.
+
 ## 1.3.0 — 2026-09-09
 
 ### Added

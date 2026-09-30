@@ -53,6 +53,19 @@ function resolveBaseUrl() {
 const API_BASE_URL = resolveBaseUrl();
 const API_KEY = (process.env.IDEA_BASE_API_KEY || '').trim();
 
+// The agent identity this server declares on every request (X-On-Behalf-Of).
+//
+// It answers "who did this?" and nothing else — it carries no permission, no
+// delegation and no elevation. Authorization stays entirely with the API key and its
+// owner. Without it, work done by an agent is recorded as the key owner, which makes
+// the owner the actor of his own notifications and silently suppresses them.
+//
+// Freeform by design, so a session may declare a different agent. The identity must
+// already exist server-side as a non-human user, or EVERY call fails closed with 403
+// AGENT_IDENTITY_NOT_RESOLVABLE / AGENT_IDENTITY_NOT_PERMITTED — deliberately loud,
+// never a silent fallback to the key owner.
+const AGENT_ID = (process.env.IDEA_BASE_AGENT_ID || 'claude_ai').trim();
+
 if (!API_KEY) {
   console.error('Error: IDEA_BASE_API_KEY environment variable is required');
   process.exit(1);
@@ -190,6 +203,7 @@ async function apiRequest(endpoint, options = {}) {
       signal: controller.signal,
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
+        'X-On-Behalf-Of': AGENT_ID,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
         ...options.headers,
@@ -622,7 +636,7 @@ const tools = [
   },
   {
     name: 'stop_working',
-    description: 'Mark that you have stopped working on a task (break or switching tasks). Optionally capture your state on the way out: pass `note` to append a work note and/or `resume_context` to overwrite the resume block, so the next session can pick up where you left off. Both are recorded as author_kind="ai".',
+    description: 'Mark that you have stopped working on a task (break or switching tasks). Optionally capture your state on the way out: pass `note` to append a work note and/or `resume_context` to overwrite the resume block, so the next session can pick up where you left off.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -644,7 +658,7 @@ const tools = [
   },
   {
     name: 'add_work_note',
-    description: 'Append a timestamped work note (status update) to a task\'s activity log. Use this to record progress so a future session can pick up where you left off (e.g. "finished auth handler, tests green, next: wire the callback"). Notes are append-only and never overwrite each other. Set author_kind="human" ONLY when you are relaying a note dictated by the human user; use "ai" (the default) when leaving your own status update.',
+    description: 'Append a timestamped work note (status update) to a task\'s activity log. Use this to record progress so a future session can pick up where you left off (e.g. "finished auth handler, tests green, next: wire the callback"). Notes are append-only and never overwrite each other.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -656,11 +670,6 @@ const tools = [
           type: 'string',
           description: 'The work note / status update text',
         },
-        author_kind: {
-          type: 'string',
-          enum: ['ai', 'human'],
-          description: 'Who authored this note: "ai" (default, your own update) or "human" (you are relaying something the user said).',
-        },
         is_internal: {
           type: 'boolean',
           description: 'Whether the note is internal-only (hidden from customers). Defaults to true for work notes.',
@@ -671,7 +680,7 @@ const tools = [
   },
   {
     name: 'add_comment',
-    description: 'Add a comment to a task\'s discussion thread. Unlike work notes (progress journal), comments are for communication and are customer-visible by default. Set author_kind="human" when relaying the user\'s words; use "ai" (default) for your own.',
+    description: 'Add a comment to a task\'s discussion thread. Unlike work notes (progress journal), comments are for communication and are customer-visible by default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -683,11 +692,6 @@ const tools = [
           type: 'string',
           description: 'The comment text',
         },
-        author_kind: {
-          type: 'string',
-          enum: ['ai', 'human'],
-          description: 'Who authored this comment: "ai" (default) or "human" (relaying the user).',
-        },
         is_internal: {
           type: 'boolean',
           description: 'Whether the comment is internal-only (hidden from customers). Defaults to false.',
@@ -698,7 +702,7 @@ const tools = [
   },
   {
     name: 'set_resume_context',
-    description: 'Set (overwrite) the task\'s resume context — a single pinned block describing the current state, what is done, what is next, and where to look. This is read first when a work session restarts cold (e.g. via start_working) so you can re-orient immediately. Update it at the end of a work session. Set author_kind="human" only when relaying the user\'s words; default "ai".',
+    description: 'Set (overwrite) the task\'s resume context — a single pinned block describing the current state, what is done, what is next, and where to look. This is read first when a work session restarts cold (e.g. via start_working) so you can re-orient immediately. Update it at the end of a work session.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -709,11 +713,6 @@ const tools = [
         context: {
           type: 'string',
           description: 'The resume-context text (markdown ok): current state / next steps / where to look.',
-        },
-        author_kind: {
-          type: 'string',
-          enum: ['ai', 'human'],
-          description: 'Who authored this context: "ai" (default) or "human".',
         },
       },
       required: ['task_id', 'context'],
@@ -1100,14 +1099,14 @@ const toolHandlers = {
     if (note && note.trim()) {
       await apiRequest(`/tasks/${task_id}/activity`, {
         method: 'POST',
-        body: JSON.stringify({ note, author_kind: 'ai', is_internal: true }),
+        body: JSON.stringify({ note, is_internal: true }),
       });
       captured.push('work note');
     }
     if (resume_context !== undefined && resume_context !== null) {
       await apiRequest(`/tasks/${task_id}`, {
         method: 'PUT',
-        body: JSON.stringify({ resume_context, resume_context_author_kind: 'ai' }),
+        body: JSON.stringify({ resume_context }),
       });
       captured.push('resume context');
     }
@@ -1127,46 +1126,46 @@ const toolHandlers = {
     };
   },
 
-  async add_work_note({ task_id, note, author_kind = 'ai', is_internal = true }) {
+  async add_work_note({ task_id, note, is_internal = true }) {
     const saved = await apiRequest(`/tasks/${task_id}/activity`, {
       method: 'POST',
-      body: JSON.stringify({ note, author_kind, is_internal }),
+      body: JSON.stringify({ note, is_internal }),
     });
     return {
       content: [
         {
           type: 'text',
-          text: `Work note added to task #${task_id} (as ${author_kind === 'ai' ? 'AI Agent' : 'human'}). Note id: ${saved.id}.`,
+          text: `Work note added to task #${task_id} (as ${AGENT_ID}). Note id: ${saved.id}.`,
         },
       ],
     };
   },
 
-  async add_comment({ task_id, comment, author_kind = 'ai', is_internal = false }) {
+  async add_comment({ task_id, comment, is_internal = false }) {
     const saved = await apiRequest(`/tasks/${task_id}/comments`, {
       method: 'POST',
-      body: JSON.stringify({ comment, author_kind, is_internal }),
+      body: JSON.stringify({ comment, is_internal }),
     });
     return {
       content: [
         {
           type: 'text',
-          text: `Comment added to task #${task_id} (as ${author_kind === 'ai' ? 'AI Agent' : 'human'}). Comment id: ${saved.id}.`,
+          text: `Comment added to task #${task_id} (as ${AGENT_ID}). Comment id: ${saved.id}.`,
         },
       ],
     };
   },
 
-  async set_resume_context({ task_id, context, author_kind = 'ai' }) {
+  async set_resume_context({ task_id, context }) {
     await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
-      body: JSON.stringify({ resume_context: context, resume_context_author_kind: author_kind }),
+      body: JSON.stringify({ resume_context: context }),
     });
     return {
       content: [
         {
           type: 'text',
-          text: `Resume context updated for task #${task_id} (as ${author_kind === 'ai' ? 'AI Agent' : 'human'}). The next session that calls start_working will read this first.`,
+          text: `Resume context updated for task #${task_id} (as ${AGENT_ID}). The next session that calls start_working will read this first.`,
         },
       ],
     };
