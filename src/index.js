@@ -448,6 +448,19 @@ const tools = [
           type: 'string',
           description: 'URL of the GitHub Pull Request implementing this task. Used to fetch the PR diff for AI verification and to match incoming CI status (check_run/check_suite/workflow_run webhooks) back to this task.',
         },
+        sort_order: {
+          type: 'number',
+          description: 'Position among the project\'s tasks (lower sorts first). NOT wired on the REST create path — POST /api/projects/:id/tasks always assigns MAX(sort_order)+1 and ignores this field on create. Set it after creation with update_task instead.',
+        },
+        is_milestone: {
+          type: 'boolean',
+          description: 'Mark this task as a milestone, drawn differently on the Gantt view. NOT wired on the REST create path — POST /api/projects/:id/tasks does not accept this field; the column is left at its default (0). Set it after creation with update_task instead.',
+        },
+        required_ci_checks: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Which named CI checks (matched case-insensitively as a substring of the check name) must pass for "ci_required"/"all" verification_mode to consider CI satisfied — e.g. ["build","test"]. Read by GET /api/tasks/:id/ci-status\'s resolveRequiredChecks (app/functions/api/tasks/[id]/ci-status.js:13-32), NOT by the GitHub webhook handler, which sets ci_status unconditionally from whichever single check/workflow event just arrived. Omit to leave unset (falls back to the project\'s own required_ci_checks, then to requiring every check). NOT wired on the REST create path — POST /api/projects/:id/tasks does not accept this field. Set it after creation with update_task instead.',
+        },
       },
       required: ['project_id', 'title'],
     },
@@ -502,6 +515,19 @@ const tools = [
         github_pr_url: {
           type: 'string',
           description: 'URL of the GitHub Pull Request implementing this task. Used to fetch the PR diff for AI verification and to match incoming CI status back to this task. Pass an empty string to clear it.',
+        },
+        sort_order: {
+          type: 'number',
+          description: 'Position among the project\'s tasks (lower sorts first). Drives the order returned by list_tasks and the board/list views.',
+        },
+        is_milestone: {
+          type: 'boolean',
+          description: 'Mark this task as a milestone, drawn differently on the Gantt view. Pass false to unmark it.',
+        },
+        required_ci_checks: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Which named CI checks (matched case-insensitively as a substring of the check name) must pass for "ci_required"/"all" verification_mode to consider CI satisfied — e.g. ["build","test"]. Read by GET /api/tasks/:id/ci-status\'s resolveRequiredChecks (app/functions/api/tasks/[id]/ci-status.js:13-32), NOT by the GitHub webhook handler, which sets ci_status unconditionally from whichever single check/workflow event just arrived regardless of this field. Stored as a JSON array. Pass an empty array to require every check; this tool has no way to clear the column back to "inherit from project" (the REST API reserves that for an empty string, which this array-typed field cannot send).',
         },
         blocked_by: {
           type: 'array',
@@ -915,7 +941,12 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks }) {
+    // sort_order, is_milestone and required_ci_checks are forwarded for parity
+    // with update_task, but POST /api/projects/:id/tasks does not destructure
+    // any of the three — it always assigns MAX(sort_order)+1 and leaves
+    // is_milestone/required_ci_checks at their column defaults. Sending them
+    // here is a silent no-op on create; use update_task right after to set them.
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -930,6 +961,9 @@ const toolHandlers = {
         parent_task_id,
         verification_mode,
         github_pr_url,
+        sort_order,
+        is_milestone,
+        required_ci_checks,
       }),
     });
     return {
@@ -942,12 +976,13 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks }) {
     // Only forward what the caller actually named. An absent key leaves the
     // field alone; an explicitly empty string is how a date, the assignee or
     // the PR link is cleared, and blocked_by is a REPLACE so an explicit []
     // must reach the API — which is why these are `!== undefined` rather than
-    // truthiness.
+    // truthiness. is_milestone follows the same rule: `false` is a real value,
+    // not an absence, and must still reach the API.
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
@@ -961,6 +996,9 @@ const toolHandlers = {
     if (blocked_reason !== undefined) updates.blocked_reason = blocked_reason;
     if (verification_mode !== undefined) updates.verification_mode = verification_mode;
     if (github_pr_url !== undefined) updates.github_pr_url = github_pr_url;
+    if (sort_order !== undefined) updates.sort_order = sort_order;
+    if (is_milestone !== undefined) updates.is_milestone = is_milestone;
+    if (required_ci_checks !== undefined) updates.required_ci_checks = required_ci_checks;
 
     const task = await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
