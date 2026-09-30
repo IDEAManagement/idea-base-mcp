@@ -226,6 +226,7 @@ async function apiRequest(endpoint, options = {}) {
 
   if (!response.ok) {
     let message = `API error: ${response.status}`;
+    let code = null;
     const contentType = (response.headers.get('content-type') || '');
     if (contentType.includes('json')) {
       try {
@@ -233,11 +234,20 @@ async function apiRequest(endpoint, options = {}) {
         if (typeof body?.error === 'string' && body.error) {
           message = body.error.slice(0, MAX_ERROR_CHARS);
         }
+        // Machine-readable discriminator, when the endpoint supplies one. A
+        // handler needs to tell "you have no open session" (a real answer the
+        // caller must see) apart from "that endpoint is not deployed yet"
+        // (an infrastructure fact it should degrade around), and string-matching
+        // a prose error message to decide that is how quiet bugs get written.
+        if (typeof body?.code === 'string' && body.code) code = body.code;
       } catch {
         // fall through to the generic status message
       }
     }
-    throw new Error(redact(message));
+    const error = new Error(redact(message));
+    error.status = response.status;
+    if (code) error.code = code;
+    throw error;
   }
 
   return parseJsonBody(text, response);
@@ -750,7 +760,7 @@ const tools = [
   },
   {
     name: 'start_working',
-    description: 'Mark that you are actively working on a task. This shows other team members that the task is being worked on and by whom.',
+    description: 'Start work on a task. Two things happen: you are shown to the team as actively working on it (and a todo task moves to in_progress), and a TIMED WORK SESSION is opened with a UTC start instant, so how long the task was actually worked becomes measurable instead of guessed.\n\nCalling it a second time on the same task NEVER opens a second session. If your session is paused it is resumed; if it is already running you are told so, with how long it has been going. The response always says which of the three happened.\n\nIt also orients a cold session: the response carries the task\'s resume context and its recent work notes, so read the whole thing before you start. Pair it with stop_working, and use pause_working when you have to wait on something.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -764,7 +774,7 @@ const tools = [
   },
   {
     name: 'stop_working',
-    description: 'Mark that you have stopped working on a task (break or switching tasks). Optionally capture your state on the way out: pass `note` to append a work note and/or `resume_context` to overwrite the resume block, so the next session can pick up where you left off.',
+    description: 'Stop working on a task: close your open work session with a UTC end instant, and drop the "actively working" flag (you stay assigned). The closed session is what makes the task\'s worked duration reportable.\n\nRequires an open session — if you have none this FAILS and writes nothing, rather than inventing a session with no start. Call start_working first.\n\nThis ENDS the session. If you are only waiting on something and intend to carry on afterwards, use pause_working instead: a pause keeps the session open and records why you stopped, which is what decides whether the interval counts as worked time.\n\nOptionally capture your state on the way out: pass `note` to append a work note and/or `resume_context` to overwrite the resume block, so the next session can pick up where you left off.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -779,6 +789,43 @@ const tools = [
         resume_context: {
           type: 'string',
           description: 'Optional resume-context block to overwrite before stopping (current state / next steps / where to look).',
+        },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'pause_working',
+    description: 'Pause your open work session without ending it, and record WHY. Use this whenever work stops but is not finished — you asked the human a question, you are waiting on another agent, you are blocked on a build.\n\nTHE REASON IS THE POINT, and it decides the number:\n  waiting_on_human — you are blocked on a person and CANNOT proceed. The paused interval is EXCLUDED from worked time.\n  waiting_on_agent — you are blocked on another agent or an automated run that is itself active. The interval IS COUNTED as worked time: a sub-agent blocked on another active sub-agent is still working.\n  other — anything else. Counted as worked.\n\nOnly waiting on the human is not working. Choose waiting_on_human ONLY when a person has to act before you can continue; if a machine or another agent is doing the work, it is waiting_on_agent.\n\nResume with resume_working. Do NOT use stop_working for a pause — that ends the session and the reason is lost.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'number',
+          description: 'The ID of the task whose session to pause',
+        },
+        reason: {
+          type: 'string',
+          enum: ['waiting_on_human', 'waiting_on_agent', 'other'],
+          description: 'Why work stopped. waiting_on_human EXCLUDES this interval from worked time; waiting_on_agent and other INCLUDE it. Required — there is no default, because the whole worked-time figure turns on this value.',
+        },
+        detail: {
+          type: 'string',
+          description: 'Optional free text: what specifically you are waiting on (e.g. "asked whether to merge PR #280").',
+        },
+      },
+      required: ['task_id', 'reason'],
+    },
+  },
+  {
+    name: 'resume_working',
+    description: 'Resume your paused work session — closes the pause by recording the UTC instant you came back, so the paused interval has both boundaries and can be measured. The session itself was never closed and keeps its original start.\n\nFails if the session is not paused, rather than pretending to resume something. start_working also resumes a paused session, so use whichever reads better; this one does not re-fetch the orientation block.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'number',
+          description: 'The ID of the task whose session to resume',
         },
       },
       required: ['task_id'],
@@ -1293,10 +1340,35 @@ const toolHandlers = {
   },
 
   async start_working({ task_id }) {
+    // Presence first, and unchanged: this is what writes the `started_working`
+    // task_events row and promotes a todo task to in_progress. The timed session
+    // below sits ALONGSIDE that audit trail, it does not replace it.
     await apiRequest(`/tasks/${task_id}/assignments`, {
       method: 'POST',
       body: JSON.stringify({ is_active: true }),
     });
+
+    // Open (or resume, or report) the work session. Non-fatal by design: the
+    // presence write already succeeded, and a session failure must not make
+    // start_working look like it did nothing.
+    let timing = '';
+    try {
+      const result = await apiRequest(`/tasks/${task_id}/work-session`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      const s = result.session || {};
+      if (result.action === 'resumed') {
+        const p = result.resumed_pause || {};
+        timing = `\n\nResumed work session #${s.id}, open since ${s.started_at} — the ${p.reason} pause that began at ${p.paused_at} is now closed. No second session was opened.`;
+      } else if (result.action === 'already_running') {
+        timing = `\n\nWork session #${s.id} was ALREADY running (started ${s.started_at}, ${s.worked_minutes} min worked so far). No second session was opened.`;
+      } else {
+        timing = `\n\nWork session #${s.id} opened at ${s.started_at} (UTC). Close it with stop_working; if you have to wait on something, use pause_working so the reason is recorded.`;
+      }
+    } catch (error) {
+      timing = `\n\n(Work session NOT recorded: ${error.message} — your presence flag is set, but no duration will be measured for this stretch.)`;
+    }
 
     // Orient a cold-starting session: surface the resume context + recent work notes.
     let orientation = '';
@@ -1330,7 +1402,7 @@ const toolHandlers = {
       content: [
         {
           type: 'text',
-          text: `Started working on task #${task_id}. Other team members can now see you are actively working on this task.${orientation}`,
+          text: `Started working on task #${task_id}. Other team members can now see you are actively working on this task.${timing}${orientation}`,
         },
       ],
     };
@@ -1353,6 +1425,42 @@ const toolHandlers = {
       captured.push('resume context');
     }
 
+    // Close the session BEFORE dropping presence, so a task with no open
+    // session fails here and nothing at all is changed.
+    //
+    // A missing session is a real answer, not an infrastructure hiccup: it means
+    // the caller believes it was timing work that was never timed. Report it and
+    // stop, rather than writing a session row with no start or silently clearing
+    // the flag as if a duration had been recorded. Any OTHER session failure
+    // (the endpoint being unreachable, say) must not strand the presence flag,
+    // so that one is reported and the stop continues.
+    let timing = '';
+    let sessionError = null;
+    try {
+      const result = await apiRequest(`/tasks/${task_id}/work-session`, {
+        method: 'DELETE',
+        body: JSON.stringify({ state: 'completed' }),
+      });
+      const s = result.session || {};
+      const paused = Number(s.paused_minutes || 0);
+      const pausedText = paused > 0
+        ? ` (${s.elapsed_minutes} min elapsed, ${paused} min of that paused)`
+        : '';
+      timing = ` Work session #${s.id} closed at ${s.ended_at} — ${s.worked_minutes} minutes worked${pausedText}.`;
+    } catch (error) {
+      sessionError = error;
+    }
+
+    if (sessionError?.code === 'NO_OPEN_SESSION') {
+      throw new Error(
+        `${sessionError.message} Nothing was changed: no session row was written and ` +
+        'your active-work flag was left as it was.'
+      );
+    }
+    if (sessionError) {
+      timing = ` (Work session NOT closed: ${sessionError.message})`;
+    }
+
     await apiRequest(`/tasks/${task_id}/assignments?stop_only=true`, {
       method: 'DELETE',
     });
@@ -1362,7 +1470,51 @@ const toolHandlers = {
       content: [
         {
           type: 'text',
-          text: `Stopped working on task #${task_id}. You are still assigned to the task but no longer marked as actively working.${capturedText}`,
+          text: `Stopped working on task #${task_id}. You are still assigned to the task but no longer marked as actively working.${timing}${capturedText}`,
+        },
+      ],
+    };
+  },
+
+  async pause_working({ task_id, reason, detail }) {
+    const result = await apiRequest(`/tasks/${task_id}/work-session/pause`, {
+      method: 'POST',
+      body: JSON.stringify({ reason, note: detail }),
+    });
+    const p = result.pause || {};
+    const s = result.session || {};
+    const counted = result.counts_as_worked
+      ? 'This interval WILL count as worked time.'
+      : 'This interval will NOT count as worked time.';
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `Paused work session #${s.id} on task #${task_id} at ${p.paused_at} (reason: ${reason}). ` +
+            `${counted} ${s.worked_minutes} minutes worked so far. ` +
+            'The session is still open — call resume_working when you are back.',
+        },
+      ],
+    };
+  },
+
+  async resume_working({ task_id }) {
+    const result = await apiRequest(`/tasks/${task_id}/work-session/resume`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    const p = result.resumed_pause || {};
+    const s = result.session || {};
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `Resumed work session #${s.id} on task #${task_id} at ${p.resumed_at}. ` +
+            `The ${p.reason} pause ran ${p.minutes} minutes and ` +
+            `${p.counts_as_worked ? 'COUNTS as worked time' : 'is EXCLUDED from worked time'}. ` +
+            `${s.worked_minutes} minutes worked on this session so far.`,
         },
       ],
     };

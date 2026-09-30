@@ -85,8 +85,24 @@ Ask Claude to manage your projects:
 | Tool | Description |
 |------|-------------|
 | `log_time` | Log time against a task with notes |
-| `start_working` | Mark yourself as actively working on a task (surfaces the saved resume context + recent work notes so a cold session re-orients) |
-| `stop_working` | Stop active work on a task (optionally capture a `note` and/or `resume_context` on the way out) |
+| `start_working` | Open a timed work session on a task, and mark yourself actively working (surfaces the saved resume context + recent work notes so a cold session re-orients). Calling it twice never opens a second session — it resumes or reports the one you have |
+| `pause_working` | Pause the open session without ending it, with a required `reason` |
+| `resume_working` | Close the pause and carry on in the same session |
+| `stop_working` | Close the session with a UTC end instant and drop the active flag (optionally capture a `note` and/or `resume_context` on the way out). Fails if you have no open session |
+
+**Sessions are measured, and the pause reason decides the number.** `start_working`
+records a UTC start instant, `stop_working` a UTC end instant, and each pause in
+between records both its boundaries plus why work stopped:
+
+| `reason` | Effect on worked time |
+|---|---|
+| `waiting_on_human` | **Excluded.** A person has to act before you can continue |
+| `waiting_on_agent` | **Counted.** A sub-agent blocked on another *active* sub-agent is still working |
+| `other` | Counted |
+
+Only waiting on the human is not working. Use `pause_working` rather than
+`stop_working` whenever you intend to carry on — `stop_working` ends the session
+and the reason is lost.
 
 ### Activity & Audit Trail
 
