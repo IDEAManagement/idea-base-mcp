@@ -439,6 +439,15 @@ const tools = [
           type: 'number',
           description: 'Make this a SUBTASK of the given task. The parent must be in the same project, and a subtask cannot itself have subtasks (one level only). A parent with subtasks takes its status from them: any subtask in progress makes the parent in progress, and all subtasks done makes it ready to complete.',
         },
+        verification_mode: {
+          type: 'string',
+          enum: ['manual', 'ai_review', 'ci_required', 'all'],
+          description: 'Gate this task\'s own completion. "manual" (default) allows a plain status change to done. "ai_review" or "all" BLOCK marking the task done (403 VERIFICATION_REQUIRED) until ai_completion_score reaches 0.8 — run "Verify with AI" first. "ci_required" or "all" BLOCK it until a PR is linked (github_pr_url) with passing CI. Setting this arms a real check against your own future attempt to close the task.',
+        },
+        github_pr_url: {
+          type: 'string',
+          description: 'URL of the GitHub Pull Request implementing this task. Used to fetch the PR diff for AI verification and to match incoming CI status (check_run/check_suite/workflow_run webhooks) back to this task.',
+        },
       },
       required: ['project_id', 'title'],
     },
@@ -484,6 +493,15 @@ const tools = [
         assignee_user_id: {
           type: 'string',
           description: 'User ID to assign the task to, replacing any existing assignee. Must be a member of the same account. Pass an empty string to unassign.',
+        },
+        verification_mode: {
+          type: 'string',
+          enum: ['manual', 'ai_review', 'ci_required', 'all'],
+          description: 'Gate this task\'s own completion. "manual" (default) allows a plain status change to done. "ai_review" or "all" BLOCK marking the task done (403 VERIFICATION_REQUIRED) until ai_completion_score reaches 0.8 — run "Verify with AI" first. "ci_required" or "all" BLOCK it until a PR is linked (github_pr_url) with passing CI. Setting this arms a real check against your own future attempt to close the task.',
+        },
+        github_pr_url: {
+          type: 'string',
+          description: 'URL of the GitHub Pull Request implementing this task. Used to fetch the PR diff for AI verification and to match incoming CI status back to this task. Pass an empty string to clear it.',
         },
         blocked_by: {
           type: 'array',
@@ -897,7 +915,7 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url }) {
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -910,6 +928,8 @@ const toolHandlers = {
         due_date,
         assignee_user_id,
         parent_task_id,
+        verification_mode,
+        github_pr_url,
       }),
     });
     return {
@@ -922,11 +942,12 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url }) {
     // Only forward what the caller actually named. An absent key leaves the
-    // field alone; an explicitly empty string is how a date or the assignee is
-    // cleared, and blocked_by is a REPLACE so an explicit [] must reach the
-    // API — which is why these are `!== undefined` rather than truthiness.
+    // field alone; an explicitly empty string is how a date, the assignee or
+    // the PR link is cleared, and blocked_by is a REPLACE so an explicit []
+    // must reach the API — which is why these are `!== undefined` rather than
+    // truthiness.
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
@@ -938,6 +959,8 @@ const toolHandlers = {
     if (assignee_user_id !== undefined) updates.assignee_user_id = assignee_user_id;
     if (blocked_by !== undefined) updates.blocked_by = blocked_by;
     if (blocked_reason !== undefined) updates.blocked_reason = blocked_reason;
+    if (verification_mode !== undefined) updates.verification_mode = verification_mode;
+    if (github_pr_url !== undefined) updates.github_pr_url = github_pr_url;
 
     const task = await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
