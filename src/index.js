@@ -566,6 +566,54 @@ const tools = [
     },
   },
   {
+    name: 'verify_task',
+    description: 'Run AI verification: grades this task\'s acceptance_criteria against the diff of its linked PR (a Haiku relevance pre-screen, then a Sonnet deep review) and PERSISTS the result to ai_completion_score / ai_completion_notes. This is exactly what update_task_status checks when the task\'s verification_mode is "ai_review" or "all" — call this to satisfy that gate yourself rather than repeatedly hitting 403 VERIFICATION_REQUIRED with no way through it.\n\nCOSTS MONEY — DO NOT LOOP THIS. Every call is metered via recordAIUsage and recorded to ai_generations (Sonnet, large PR-diff context) for audit. It runs FREE while your account is within its plan\'s included monthly verification cap; once over that cap each call is billed as AI credit overage — 2 credits per call on this account. Calling this repeatedly hoping for a higher score spends real credits for no guaranteed gain; if a genuine score lands below the 0.8 gate, that is a finding about the work, not a reason to retry.\n\nGRADES THE DIFF, NOT THE RUNNING SYSTEM. A high score means the PR\'s code changes look like they satisfy the criteria on paper — it is NOT proof the deployed/running behavior actually works. Never report this score as end-to-end verification; that is a human\'s job or an independent task-verify sub-agent\'s, not this tool\'s.\n\nRequires the task to already have non-empty acceptance_criteria (set via update_task) and a way to see the work: either the task\'s own github_pr_url (set via update_task) or a pr_url/work_description passed here. Fails with a clear message naming what is missing rather than grading an empty contract — refusal is free, no credits spent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'number',
+          description: 'The ID of the task to verify. Must already have non-empty acceptance_criteria.',
+        },
+        pr_url: {
+          type: 'string',
+          description: 'GitHub PR URL to grade against, for this call only — does not overwrite the task\'s stored github_pr_url. Omit to use the task\'s own linked PR.',
+        },
+        work_description: {
+          type: 'string',
+          description: 'Free-text description of the completed work to grade against. Used ONLY as a fallback when no PR diff is available (no pr_url given here and the task has no github_pr_url); ignored whenever a PR diff can be fetched.',
+        },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'record_verification_feedback',
+    description: 'Record whether the most recent verify_task verdict on this task was accurate — calibration data, not a correction. Attaches to the latest ai_generations row of type completion_review for this task, so verify_task must have run at least once first. Does NOT change the stored ai_completion_score or re-run any model — it costs nothing (no Anthropic call, just an audit-log row) and is safe to call as often as useful.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'number',
+          description: 'The ID of the task whose most recent verification you are giving feedback on.',
+        },
+        agreed: {
+          type: 'boolean',
+          description: 'Whether you agree the AI verdict (score + summary) was an accurate read of the work.',
+        },
+        actual_score: {
+          type: 'number',
+          description: 'Optional: the score (0.0-1.0) you believe was actually correct, if you disagree with the AI\'s score.',
+        },
+        notes: {
+          type: 'string',
+          description: 'Optional: why you agreed or disagreed.',
+        },
+      },
+      required: ['task_id', 'agreed'],
+    },
+  },
+  {
     name: 'log_time',
     description: 'Log time spent on a task. This triggers a real-time notification showing time was logged.',
     inputSchema: {
@@ -1024,6 +1072,51 @@ const toolHandlers = {
         {
           type: 'text',
           text: `Task ${task_id} status updated to "${status}". This change has been broadcast to all connected users.`,
+        },
+      ],
+    };
+  },
+
+  async verify_task({ task_id, pr_url, work_description }) {
+    const body = {};
+    if (pr_url !== undefined) body.pr_url = pr_url;
+    if (work_description !== undefined) body.work_description = work_description;
+
+    const result = await apiRequest(`/tasks/${task_id}/verify`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+
+    const billingNote = result.billing?.type === 'ai_credit_overage'
+      ? `Billed ${result.billing.credits_charged} AI credit(s) as overage (over your plan's included verification cap).`
+      : 'Free platform feature — within your plan\'s included verification cap.';
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Verification score for task ${task_id}: ${result.score} (confidence: ${result.confidence}). ${billingNote} ` +
+                `This grades the PR diff against the acceptance criteria, not the running system.\n\n${JSON.stringify(result, null, 2)}`,
+        },
+      ],
+    };
+  },
+
+  async record_verification_feedback({ task_id, agreed, actual_score, notes }) {
+    const body = { agreed };
+    if (actual_score !== undefined) body.actual_score = actual_score;
+    if (notes !== undefined) body.notes = notes;
+
+    await apiRequest(`/tasks/${task_id}/verify-feedback`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Feedback recorded for task ${task_id}'s most recent AI verification (agreed: ${agreed}).`,
         },
       ],
     };
