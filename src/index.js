@@ -433,7 +433,7 @@ const tools = [
         },
         assignee_user_id: {
           type: 'string',
-          description: 'User ID to assign the task to. Must be a member of the same account. Omit to leave the task unassigned.',
+          description: 'User ID to assign the task to. Must be a member of the same account. Omit to leave the task unassigned. For a SECOND (or third, ...) assignee, do not call this again — use add_assignee after creation, since this field only ever sets a single owner at create time.',
         },
         parent_task_id: {
           type: 'number',
@@ -505,7 +505,7 @@ const tools = [
         },
         assignee_user_id: {
           type: 'string',
-          description: 'User ID to assign the task to, replacing any existing assignee. Must be a member of the same account. Pass an empty string to unassign.',
+          description: 'User ID to assign the task to, REPLACING THE WHOLE assignee set (every non-active assignment row is deleted, active workers spared) — use this only when you want exactly one owner. Must be a member of the same account. Pass an empty string to unassign everyone (active workers still spared). To ADD a second assignee without touching the first, use add_assignee instead; to remove just one, use remove_assignee.',
         },
         verification_mode: {
           type: 'string',
@@ -563,6 +563,42 @@ const tools = [
         },
       },
       required: ['task_id', 'status'],
+    },
+  },
+  {
+    name: 'add_assignee',
+    description: 'Assign a user to a task WITHOUT disturbing anyone already assigned. task_assignments holds one row per (task_id, user_id) — POST /api/tasks/:id/assignments upserts exactly that one row and leaves every other assignee alone, unlike update_task\'s assignee_user_id (which REPLACES the whole set — use that only when you actually want a single owner). This is the fix for the defect where a second MCP assignment silently dropped the first.\n\nIdempotent and is_active-safe: this checks the task\'s current assignees first, and if the user already holds a row (assigned OR actively working) it does nothing and says so, rather than re-POSTing. That matters because the REST endpoint\'s upsert OVERWRITES is_active on conflict — a blind re-assign of someone with a running timer (is_active=1, set by start_working) would silently stop their clock. Skipping the no-op re-POST is what keeps assignment and active-work presence independent.\n\nRejects a user who is not a member of this account (404, surfaced as an error) rather than creating a dangling assignment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'number',
+          description: 'The ID of the task to assign the user to.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'User ID to add as an assignee. Must be a member of the same account.',
+        },
+      },
+      required: ['task_id', 'user_id'],
+    },
+  },
+  {
+    name: 'remove_assignee',
+    description: 'Remove exactly one user\'s assignment from a task, leaving every other assignee untouched. DELETE /api/tasks/:id/assignments?user_id=... removes that one task_assignments row outright (both the assignment and any is_active flag on it) — this is a full unassign, not stop_working\'s "still assigned, no longer active" (use stop_working to end a work session without unassigning).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: {
+          type: 'number',
+          description: 'The ID of the task to remove the assignment from.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'User ID to remove from the task\'s assignees.',
+        },
+      },
+      required: ['task_id', 'user_id'],
     },
   },
   {
@@ -1072,6 +1108,58 @@ const toolHandlers = {
         {
           type: 'text',
           text: `Task ${task_id} status updated to "${status}". This change has been broadcast to all connected users.`,
+        },
+      ],
+    };
+  },
+
+  async add_assignee({ task_id, user_id }) {
+    // Check first so an already-assigned (or already-active) user is never
+    // re-POSTed: the REST upsert overwrites is_active on conflict, and a
+    // blind re-assign would silently stop that person's running timer. See
+    // POST /api/tasks/:id/assignments' ON CONFLICT clause.
+    const current = await apiRequest(`/tasks/${task_id}/assignments`);
+    const assigned = current.assigned || [];
+    const active = current.active_workers || [];
+    const existing = [...assigned, ...active].find(a => a.user_id === user_id);
+
+    if (existing) {
+      const state = active.some(a => a.user_id === user_id) ? 'actively working' : 'assigned';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `${user_id} is already ${state} on task ${task_id} — no change made. Other assignees are untouched.`,
+          },
+        ],
+      };
+    }
+
+    await apiRequest(`/tasks/${task_id}/assignments`, {
+      method: 'POST',
+      body: JSON.stringify({ user_id }),
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Assigned ${user_id} to task ${task_id}. Existing assignees, if any, were left in place.`,
+        },
+      ],
+    };
+  },
+
+  async remove_assignee({ task_id, user_id }) {
+    await apiRequest(`/tasks/${task_id}/assignments?user_id=${encodeURIComponent(user_id)}`, {
+      method: 'DELETE',
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Removed ${user_id} from task ${task_id}'s assignees. Other assignees are untouched.`,
         },
       ],
     };
