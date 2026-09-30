@@ -1,5 +1,55 @@
 # Changelog
 
+## 2.2.0 — 2026-09-30
+
+Additive. `start_working` and `stop_working` now record a real timed session
+instead of only toggling a presence flag, and two new tools record a pause and
+the reason for it.
+
+### Added
+
+- **`pause_working` and `resume_working`.** Separate tools rather than a mode
+  parameter on the existing pair, for two mechanical reasons. First, `reason`
+  can be schema-REQUIRED on a dedicated tool — folded into `stop_working` it
+  would have to be optional, because a plain stop has no reason, so a caller who
+  did not think about it silently gets a default. The entire worked-time figure
+  turns on that value, and "required only when mode=pause" is documentable but
+  not enforceable. Second, "end the session" and "keep it open" should not be one
+  token apart: under a mode flag, meaning to pause and ending the session instead
+  is a one-word typo with no signal, and an ended session cannot be un-ended.
+- **`reason` is a closed set: `waiting_on_human` | `waiting_on_agent` | `other`.**
+  This is the distinction the whole feature exists for. A `waiting_on_human`
+  pause is NOT work and is excluded from worked time. A `waiting_on_agent` pause
+  IS work and is included — a sub-agent blocked on another active sub-agent is
+  still working. Proven twice with independent fixtures: identical spans and
+  identical pause lengths differing only in reason gave 6.00 versus 10.00 worked
+  minutes on a 10-minute session.
+
+### Changed
+
+- `start_working` opens a session, or resumes the open one if this actor already
+  has a session running on that task. It does not open a second — the database
+  enforces one open session per (task, actor) as a backstop, but the tool
+  resolves it before reaching that.
+- `stop_working` closes the session with a UTC end instant and a terminal state,
+  and fails clearly with `NO_OPEN_SESSION` if there is none, rather than writing
+  a row with a null start.
+
+### Unchanged, deliberately
+
+- **`start_working`'s orientation block.** It still reads the task back and
+  surfaces `resume_context` and recent work notes — the reason the tool is worth
+  calling from a cold session. The fetch logic is byte-identical; only a timing
+  line is prepended.
+- **The `task_events` audit trail.** Both tools still call `/assignments`, so
+  `started_working` and `stopped_working` rows keep landing. Sessions sit
+  alongside that trail rather than replacing it.
+
+### Requires
+
+Server-side work-session endpoints, deployed to app.idea-base.us in commit
+7bfd4ad and confirmed resolving in production before this release was cut.
+
 ## Unreleased
 
 ### Added
