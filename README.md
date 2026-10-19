@@ -66,7 +66,7 @@ Ask Claude to manage your projects:
 | `list_projects` | List all projects with task counts and progress |
 | `get_project` | Get project details and statistics |
 | `create_project` | Create a new project or sub-project |
-| `update_project` | Update project name, description, or status |
+| `update_project` | Update a project name, description, status, parent (re-parent, or `null` to detach) or product |
 
 ### Tasks
 

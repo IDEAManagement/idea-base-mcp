@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.3.0 — 2026-10-19
+
+A project can finally be re-parented or detached through this server. The API
+has accepted both since the hierarchy shipped; the gap was entirely on this
+side, and it was two bugs deep.
+
+### Added
+
+- **`update_project` takes `parent_project_id` and `product_id`.** Pass a
+  parent id to move the project, or `null` to DETACH it into a top-level
+  project. A detached project keeps the product it had inherited — verified
+  against the live API, not assumed — so `product_id` is only needed to move it
+  to a different product. Both fields are forwarded on `!== undefined` rather
+  than on truthiness, so a name-only update can never silently detach anything.
+
+### Fixed
+
+- **The argument validator dropped every `null`, so a nullable field could not
+  exist.** `validateArgs` skipped any argument whose value was `null` before a
+  handler ran, which meant adding `parent_project_id` to the schema would not
+  on its own have made detaching possible: the field arrived, vanished, and the
+  API answered "No fields to update". `null` now survives when — and only
+  when — the tool's own schema declares it (`type: ['number', 'null']`).
+- **`coerce` compared `spec.type` with `===`,** so a union type fell through
+  every branch to the string handler. A `['number', 'null']` id would have been
+  stringified and skipped the positive-integer-id guard entirely. Branch
+  selection now reads the union.
+- **A refusal lost the half that said what to do about it.** The API splits an
+  error into `error` (the headline) and `details`; only the headline reached
+  the caller, so a plan nesting-depth or sub-project-limit refusal arrived with
+  its remedy stripped off. Both halves are now joined into the message.
+
 ## 2.2.0 — 2026-09-30
 
 Additive. `start_working` and `stop_working` now record a real timed session

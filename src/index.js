@@ -93,6 +93,18 @@ function redact(text) {
 const MAX_STRING_LEN = 20000;
 const STRING_LIMITS = { query: 500, date: 32, start_date: 32, due_date: 32 };
 
+// A schema type may be a UNION, e.g. ['number', 'null'] — the only way to say
+// "a number, or null meaning clear this". Both the null handling in
+// validateArgs and coerce's branch selection have to read that union rather
+// than compare `spec.type` with ===, or a nullable field silently behaves as a
+// string field and its null never reaches the handler at all.
+const typesOf = (spec) => {
+  const t = spec?.type;
+  return Array.isArray(t) ? t : (t ? [t] : []);
+};
+const allowsNull = (spec) => typesOf(spec).includes('null');
+const primaryType = (spec) => typesOf(spec).find((t) => t !== 'null');
+
 function validateArgs(toolName, schema, rawArgs) {
   const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
   const props = schema?.properties || {};
@@ -107,7 +119,16 @@ function validateArgs(toolName, schema, rawArgs) {
   for (const [name, value] of Object.entries(args)) {
     const spec = props[name];
     if (!spec) continue; // drop anything the tool does not declare
-    if (value === undefined || value === null) continue;
+    if (value === undefined) continue;
+    if (value === null) {
+      // null is dropped unless the tool DECLARES it meaningful. For
+      // update_project.parent_project_id it means "detach this project", and
+      // this unconditional drop is why un-parenting stayed impossible through
+      // this server: the field reached here and vanished, so the request body
+      // came out empty and the API answered "No fields to update".
+      if (allowsNull(spec)) clean[name] = null;
+      continue;
+    }
     clean[name] = coerce(toolName, name, spec, value);
   }
 
@@ -116,8 +137,9 @@ function validateArgs(toolName, schema, rawArgs) {
 
 function coerce(toolName, name, spec, value) {
   const label = `${toolName}: "${name}"`;
+  const type = primaryType(spec);
 
-  if (spec.type === 'number' || spec.type === 'integer') {
+  if (type === 'number' || type === 'integer') {
     const n = typeof value === 'number' ? value : Number(String(value).trim());
     if (!Number.isFinite(n)) throw new Error(`${label} must be a number`);
     if (name === 'id' || name.endsWith('_id')) {
@@ -128,9 +150,9 @@ function coerce(toolName, name, spec, value) {
     return n;
   }
 
-  if (spec.type === 'boolean') return Boolean(value);
+  if (type === 'boolean') return Boolean(value);
 
-  if (spec.type === 'array') {
+  if (type === 'array') {
     if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
     if (value.length > 500) throw new Error(`${label} has too many entries (max 500)`);
     return value.map((item, i) => coerce(toolName, `${name}[${i}]`, spec.items || {}, item));
@@ -232,7 +254,12 @@ async function apiRequest(endpoint, options = {}) {
       try {
         const body = JSON.parse(text);
         if (typeof body?.error === 'string' && body.error) {
-          message = body.error.slice(0, MAX_ERROR_CHARS);
+          // `error` is the headline and `details` is what to do about it — a
+          // plan-limit or product-inheritance refusal is not actionable without
+          // the second half, which used to be dropped here.
+          const parts = [body.error];
+          if (typeof body?.details === 'string' && body.details) parts.push(body.details);
+          message = parts.join(' — ').slice(0, MAX_ERROR_CHARS);
         }
         // Machine-readable discriminator, when the endpoint supplies one. A
         // handler needs to tell "you have no open session" (a real answer the
@@ -327,7 +354,7 @@ const tools = [
   },
   {
     name: 'update_project',
-    description: 'Update project details like name, description, or status.',
+    description: 'Update a project: its name, description, status, or where it sits in the hierarchy. Omitted fields are left exactly as they are. Set parent_project_id to re-parent the project, or to null to DETACH it into a top-level project; a detached project keeps the product it had inherited, so product_id is only needed to move it to a DIFFERENT product. A sub-project inherits its parent\'s product, so re-parenting under a parent in a different product moves the project there too. The API refuses a move that is circular, crosses accounts, or exceeds the plan\'s nesting depth or sub-project count, and says which.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -347,6 +374,14 @@ const tools = [
           type: 'string',
           enum: ['active', 'completed', 'archived'],
           description: 'New status for the project',
+        },
+        parent_project_id: {
+          type: ['number', 'null'],
+          description: 'Move the project under this parent. Pass null to detach it and make it top-level — it keeps whatever product it had, so no product_id is needed unless you also want to move it. Omit to leave the parent unchanged.',
+        },
+        product_id: {
+          type: 'number',
+          description: 'Move the project to this product. Only valid for a project with no parent — a sub-project cannot hold a product of its own, it inherits its parent\'s. Find ids via list_products.',
         },
       },
       required: ['project_id'],
@@ -1012,11 +1047,18 @@ const toolHandlers = {
     };
   },
 
-  async update_project({ project_id, name, description, status }) {
+  async update_project({ project_id, name, description, status, parent_project_id, product_id }) {
     const updates = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
     if (status !== undefined) updates.status = status;
+    // These two are forwarded on `!== undefined`, never on truthiness: null is
+    // the MEANINGFUL value for parent_project_id (it detaches the project), and
+    // PUT /api/projects/:id only writes a column it was actually sent — so an
+    // omitted key leaves parent and product exactly as they were, and a
+    // name-only update can never silently detach anything.
+    if (parent_project_id !== undefined) updates.parent_project_id = parent_project_id;
+    if (product_id !== undefined) updates.product_id = product_id;
 
     const project = await apiRequest(`/projects/${project_id}`, {
       method: 'PUT',
