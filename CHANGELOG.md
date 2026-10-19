@@ -1,5 +1,42 @@
 # Changelog
 
+## 2.4.0 — 2026-10-19
+
+Sprints. Eight tools, additive — nothing existing changed.
+
+### Added
+
+- **`list_sprints`, `get_sprint`, `create_sprint`, `add_tasks_to_sprint`,
+  `remove_tasks_from_sprint`, `close_sprint`, `get_sprint_cadence`,
+  `set_sprint_cadence`.**
+
+A sprint is a list of work for one period, and it is owned by the **product**:
+the product sets the cadence and owns the lifecycle, while projects add and
+remove the work. So a sprint spans every project under its product, sub-projects
+included, and it can never straddle two customers.
+
+The tool descriptions carry the rules a schema cannot express, which are the
+ones an agent would otherwise find by getting them wrong:
+
+- A task is in **at most one** sprint, and adding one that already belongs to
+  another is **refused, not moved** — silently relocating it would lose someone
+  else's commitment.
+- `create_sprint` with no dates opens the **next** sprint on the cadence, which
+  is the normal case. Explicit dates are the exception.
+- `close_sprint` is **irreversible**. It carries unfinished work into the next
+  sprint and increments each task's carry count, so work that keeps slipping
+  says so rather than being quietly re-added every period.
+- Setting a cadence is also what **opts a product into the schedule**. A product
+  with no cadence row is never rolled unattended, so "these are the defaults" is
+  not the same as "sprints are on".
+- `get_sprint` with `candidates: true` returns both the work that could be
+  pulled in **and** the work being held back as blocked, with the reason —
+  "why isn't this in my sprint" deserves an answer.
+
+`set_sprint_cadence` forwards each field on `!== undefined`, so an omitted field
+keeps its current value. In a tool with five independent settings the
+alternative quietly rewrites four of them every time one changes.
+
 ## 2.3.0 — 2026-10-19
 
 A project can finally be re-parented or detached through this server. The API

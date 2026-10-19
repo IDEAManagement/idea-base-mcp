@@ -67,6 +67,14 @@ Ask Claude to manage your projects:
 | `get_project` | Get project details and statistics |
 | `create_project` | Create a new project or sub-project |
 | `update_project` | Update a project name, description, status, parent (re-parent, or `null` to detach) or product |
+| `list_sprints` | List a product's sprints with real task counts and its cadence |
+| `get_sprint` | One sprint: tasks, counts, commitment ledger; optionally candidates + blocked work |
+| `create_sprint` | Open a sprint — next on the cadence, or an explicit window |
+| `add_tasks_to_sprint` | Commit tasks (refuses a task already in another sprint) |
+| `remove_tasks_from_sprint` | Take tasks out of a sprint |
+| `close_sprint` | Close it; unfinished work carries forward. Irreversible |
+| `get_sprint_cadence` | Read a product's sprint rhythm |
+| `set_sprint_cadence` | Set length, start weekday, carry-over, auto-open |
 
 ### Tasks
 
