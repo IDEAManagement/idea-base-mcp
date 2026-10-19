@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.5.0 — 2026-10-19
+
+Three **prompts**. Until now this server shipped 35 tools and nothing else, so
+an agent starting a sprint had to know to call several tools in the right
+order. A prompt is one invocation that returns the sprint already laid out.
+
+In Claude Code they appear as `/idea-base:start_sprint 6` (the server name comes
+from your MCP config key, so it is `/idea-base:…` for a standard install).
+
+### Added
+
+- **`start_sprint [sprint_id]`** — the goal, the window, days left, and every
+  item split into **assigned to you**, **unassigned**, and **blocked with the
+  reason**. Omit the id for the sprint covering today. Work assigned to someone
+  else is counted but not listed, because it is not yours to pick up.
+- **`sprint_report [sprint_id]`** — from the commitment ledger: committed vs
+  completed, what carried, what was released. On an open sprint it says nothing
+  has been judged yet; on a sprint closed before the ledger existed it says the
+  record was never kept, which is NOT the same as having committed to nothing.
+- **`plan_sprint <product_id>`** — the cadence, the window the next sprint would
+  cover, the eligible pool, and the work held back as blocked with its reason.
+  Works before any sprint exists.
+
+### Two rules the implementation follows
+
+- **Tracker text is untrusted.** Titles, descriptions, goals and blocked reasons
+  are written by whoever filed the work — in this product, often another agent —
+  and a prompt result is injected directly into the conversation. All of it goes
+  inside a fenced DATA block, the fence **escalates** so embedded backticks
+  cannot close it, each value is flattened to one line, and the instructions
+  above the block say plainly that it is data. The text itself is preserved
+  verbatim: flattening is not censoring.
+- **The body is bounded and says when it is.** Items are capped per group at 25
+  and the TRUE total is always printed (`showing 25 of 72`), so a truncated list
+  can never read as a complete one. There is no documented size limit for a
+  prompt result, which is a reason to cap deliberately rather than hope.
+
+A missing or malformed argument returns `-32602 InvalidParams`, not a generic
+internal error. An unknown or inaccessible id returns a readable refusal rather
+than an empty body.
+
+### Not included
+
+Per-team reporting. Sprints have no team dimension — ownership is product-level
+— so a team view would be invented rather than read.
+
 ## 2.4.0 — 2026-10-19
 
 Sprints. Eight tools, additive — nothing existing changed.
