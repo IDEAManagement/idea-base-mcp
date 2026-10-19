@@ -944,6 +944,108 @@ const tools = [
     },
   },
   {
+    name: 'list_sprints',
+    description: 'List a product\'s sprints, newest first, with real task counts and its cadence. Sprints are owned by the PRODUCT: the product sets the rhythm and owns the lifecycle, while projects add and remove the work. A sprint can hold tasks from any project under that product, sub-projects included.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        product_id: { type: 'number', description: 'The product whose sprints to list. Find ids via list_products.' },
+      },
+      required: ['product_id'],
+    },
+  },
+  {
+    name: 'get_sprint',
+    description: 'Get one sprint: its tasks with derived status, counts taken from real task rows, and — for a CLOSED sprint — the commitment ledger saying what it committed to and what became of each item. Pass candidates:true to also get the open work that could be pulled in, and the work being held back as blocked (with the reason).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sprint_id: { type: 'number', description: 'The sprint to retrieve' },
+        candidates: { type: 'boolean', description: 'Also return work eligible to be added, and blocked work held out of it. Default false.' },
+      },
+      required: ['sprint_id'],
+    },
+  },
+  {
+    name: 'create_sprint',
+    description: 'Open a sprint on a product. With no dates it opens the NEXT one on the product\'s cadence, which is the normal case; pass starts_on/ends_on only to set an explicit window. One sprint per product per period — a second for the same period is refused rather than duplicated.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        product_id: { type: 'number', description: 'The product to open the sprint on' },
+        name: { type: 'string', description: 'Optional. Defaults to its date range.' },
+        goal: { type: 'string', description: 'What this sprint is meant to achieve' },
+        starts_on: { type: 'string', description: 'YYYY-MM-DD. Omit to follow the cadence.' },
+        ends_on: { type: 'string', description: 'YYYY-MM-DD. Omit to run one cadence length from starts_on.' },
+        state: { type: 'string', enum: ['planned', 'active'], description: 'Default planned. A sprint cannot be created closed.' },
+      },
+      required: ['product_id'],
+    },
+  },
+  {
+    name: 'add_tasks_to_sprint',
+    description: 'Commit tasks to a sprint. Each task is checked on its own and the result says which were added and which were refused and why — a task already in another sprint is REFUSED, not moved, because a task belongs to at most one. Tasks must belong to a project under the sprint\'s product.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sprint_id: { type: 'number', description: 'The sprint to add to' },
+        task_ids: { type: 'array', items: { type: 'number' }, description: 'Task ids to commit (max 100)' },
+      },
+      required: ['sprint_id', 'task_ids'],
+    },
+  },
+  {
+    name: 'remove_tasks_from_sprint',
+    description: 'Take tasks out of a sprint. The tasks themselves are untouched — the sprint is the time box, not the owner of the work.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sprint_id: { type: 'number', description: 'The sprint to remove from' },
+        task_ids: { type: 'array', items: { type: 'number' }, description: 'Task ids to remove (max 100)' },
+      },
+      required: ['sprint_id', 'task_ids'],
+    },
+  },
+  {
+    name: 'close_sprint',
+    description: 'Close a sprint. Unfinished work moves into the next sprint and its carry count increments (unless the product\'s cadence has carry-over off, in which case it is released); finished work stays attached. Every task held is written to the commitment ledger first, so what the sprint committed to survives the carry. This is an action, not a status edit — closing is irreversible.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sprint_id: { type: 'number', description: 'The sprint to close' },
+        carry_to_sprint_id: { type: 'number', description: 'Optional explicit destination for unfinished work. Must be an open sprint in the same product; otherwise the next sprint is used or opened.' },
+      },
+      required: ['sprint_id'],
+    },
+  },
+  {
+    name: 'get_sprint_cadence',
+    description: 'Get a product\'s sprint rhythm: length in days, which weekday it starts, whether unfinished work carries over, and whether sprints open unattended. A product with no cadence row still reports the weekly-Monday default, flagged as not configured.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        product_id: { type: 'number', description: 'The product whose cadence to read' },
+      },
+      required: ['product_id'],
+    },
+  },
+  {
+    name: 'set_sprint_cadence',
+    description: 'Set a product\'s sprint rhythm. "Mon-Sun weekly" is length_days 7 + start_weekday 1; a Wednesday fortnight is 14 + 3. Changing it does not move sprints that already exist — it applies from the next sprint opened. Setting a cadence is also what opts a product into having sprints opened and closed on the schedule.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        product_id: { type: 'number', description: 'The product to configure' },
+        length_days: { type: 'number', description: 'Sprint length in days, 1-90. Default 7.' },
+        start_weekday: { type: 'number', description: '0 = Sunday through 6 = Saturday. Default 1 (Monday). Only decides the FIRST sprint; later ones follow the previous sprint\'s end.' },
+        carry_over_unfinished: { type: 'boolean', description: 'Move unfinished work into the next sprint on close. Default true.' },
+        auto_create: { type: 'boolean', description: 'Open the next sprint unattended on the schedule. Default true.' },
+        enabled: { type: 'boolean', description: 'Whether the schedule touches this product at all. Default true.' },
+      },
+      required: ['product_id'],
+    },
+  },
+  {
     name: 'get_product',
     description: 'Get details of a specific product including linked projects, team members, and statistics.',
     inputSchema: {
@@ -1621,6 +1723,69 @@ const toolHandlers = {
         },
       ],
     };
+  },
+
+  async list_sprints({ product_id }) {
+    const data = await apiRequest(`/products/${product_id}/sprints`);
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async get_sprint({ sprint_id, candidates }) {
+    const data = await apiRequest(`/sprints/${sprint_id}${candidates ? '?candidates=1' : ''}`);
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async create_sprint({ product_id, name, goal, starts_on, ends_on, state }) {
+    const data = await apiRequest(`/products/${product_id}/sprints`, {
+      method: 'POST',
+      body: JSON.stringify({ name, goal, starts_on, ends_on, state }),
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async add_tasks_to_sprint({ sprint_id, task_ids }) {
+    const data = await apiRequest(`/sprints/${sprint_id}/tasks`, {
+      method: 'POST',
+      body: JSON.stringify({ task_ids }),
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async remove_tasks_from_sprint({ sprint_id, task_ids }) {
+    const data = await apiRequest(`/sprints/${sprint_id}/tasks`, {
+      method: 'DELETE',
+      body: JSON.stringify({ task_ids }),
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async close_sprint({ sprint_id, carry_to_sprint_id }) {
+    const data = await apiRequest(`/sprints/${sprint_id}/close`, {
+      method: 'POST',
+      body: JSON.stringify({ carry_to_sprint_id }),
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async get_sprint_cadence({ product_id }) {
+    const data = await apiRequest(`/products/${product_id}/sprint-cadence`);
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  },
+
+  async set_sprint_cadence({ product_id, length_days, start_weekday, carry_over_unfinished, auto_create, enabled }) {
+    const body = {};
+    // Forwarded on `!== undefined` so an omitted field keeps its current value
+    // rather than being reset to a default the caller never asked for.
+    if (length_days !== undefined) body.length_days = length_days;
+    if (start_weekday !== undefined) body.start_weekday = start_weekday;
+    if (carry_over_unfinished !== undefined) body.carry_over_unfinished = carry_over_unfinished;
+    if (auto_create !== undefined) body.auto_create = auto_create;
+    if (enabled !== undefined) body.enabled = enabled;
+    const data = await apiRequest(`/products/${product_id}/sprint-cadence`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   },
 
   async get_product({ product_id }) {
