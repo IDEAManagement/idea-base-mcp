@@ -76,6 +76,20 @@ Ask Claude to manage your projects:
 | `get_sprint_cadence` | Read a product's sprint rhythm |
 | `set_sprint_cadence` | Set length, start weekday, carry-over, auto-open |
 
+### Slash commands (MCP prompts)
+
+Typed directly in Claude Code. The `idea-base` part is whatever you named the
+server in your MCP config.
+
+| Command | What it gives you |
+| --- | --- |
+| `/idea-base:start_sprint [id]` | A sprint laid out to work: goal, window, days left, and items split into assigned-to-you / unassigned / blocked-with-reason. Omit the id for the sprint covering today. |
+| `/idea-base:sprint_report [id]` | Committed vs completed, what carried and how often, from the commitment ledger written at close. |
+| `/idea-base:plan_sprint <product_id>` | Cadence, the next window, the eligible pool, and what is held back as blocked. |
+
+Tracker text in these results is fenced as data, and item lists are capped with
+the true total printed.
+
 ### Tasks
 
 | Tool | Description |
