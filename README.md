@@ -10,7 +10,9 @@ Sign in to [IDEA Base](https://app.idea-base.us), go to **Settings > API Keys**,
 
 ### 2. Add to your MCP config
 
-**Claude Code** (`~/.claude/claude_desktop_config.json`):
+**Claude Code** — project scope, `.mcp.json` in the repo root (shared with the
+team; put the key in your environment rather than in this file if it is
+committed):
 
 ```json
 {
@@ -42,10 +44,17 @@ Sign in to [IDEA Base](https://app.idea-base.us), go to **Settings > API Keys**,
 }
 ```
 
-Or via Claude Code CLI:
+**Claude Desktop** (`claude_desktop_config.json`) takes the same `mcpServers`
+block.
+
+Or via the Claude Code CLI — note `--env` goes **before** the `--`, not after
+it. Everything after `--` is passed to the server as argv, and this server does
+not read argv at all, so a key placed there never arrives and startup fails with
+`IDEA_BASE_API_KEY environment variable is required`:
+
 ```bash
-claude mcp add idea-base -- npx -y @idea-base/mcp-server \
-  --env IDEA_BASE_API_KEY=ib_your_api_key_here
+claude mcp add idea-base --env IDEA_BASE_API_KEY=ib_your_api_key_here \
+  -- npx -y @idea-base/mcp-server
 ```
 
 ### 3. Start using it
@@ -151,6 +160,63 @@ For AI agents, these leave a durable trail of *what was done and why* on each ta
 |----------|----------|-------------|
 | `IDEA_BASE_API_KEY` | Yes | Your API key from Settings > API Keys |
 | `IDEA_BASE_API_URL` | No | Custom API URL (default: `https://app.idea-base.us/api`) |
+| `IDEA_BASE_AGENT_ID` | No | The agent identity this server declares as the actor on every request, via `X-On-Behalf-Of` (default: `claude_ai`). Attribution only — it carries no permission, and the identity must already exist server-side as a non-human user or every call fails closed with a 403. |
+| `IDEA_BASE_HEARTBEAT` | No | Set to `off` (or `0`/`false`/`no`) to disable session heartbeats entirely. See below. |
+| `IDEA_BASE_HEARTBEAT_INTERVAL_SECONDS` | No | Heartbeat interval (default `60`, floor `10`). |
+
+## Session Heartbeats
+
+Once you call `start_working`, this server reports that the session is alive —
+so the agent shows up on the IDEA Base dashboard's live agent board, and
+disappears from it when the session ends.
+
+**There is nothing to install and nothing to configure.** No hook to register,
+no `settings.json` to edit, no `postinstall`. If you have this server, you have
+this.
+
+**What it sends**, to `POST /api/heartbeat`, authenticated with the same API key
+and attributed to the same `IDEA_BASE_AGENT_ID` as every other call:
+
+| When | Event |
+|---|---|
+| `start_working` | `start` |
+| every `IDEA_BASE_HEARTBEAT_INTERVAL_SECONDS` while a task is active | `tool` |
+| any tool call, at most once per interval | `tool` |
+| `stop_working`, or the client's pipe closing | `stop` |
+
+The payload is the event, the task id, the session id and the project directory
+name. Nothing else — no tool names, no arguments, no file contents, no code.
+
+**What it writes to your disk: nothing.** This server has no `fs` access at all
+(see [SECURITY-REVIEW.md](SECURITY-REVIEW.md)) and heartbeats did not change
+that. The session id is `CLAUDE_CODE_SESSION_ID` when the client provides one,
+otherwise a random `mcp-<uuid>` generated in memory for the life of the process.
+
+**To turn it off:**
+
+```json
+{
+  "mcpServers": {
+    "idea-base": {
+      "command": "npx",
+      "args": ["-y", "@idea-base/mcp-server"],
+      "env": {
+        "IDEA_BASE_API_KEY": "...",
+        "IDEA_BASE_HEARTBEAT": "off"
+      }
+    }
+  }
+}
+```
+
+The server prints `IDEA Base heartbeats: DISABLED` to stderr at startup so the
+setting is confirmable rather than assumed. Every other tool keeps working.
+
+A heartbeat can never fail a tool call: it is never awaited, every error is
+swallowed, and the interval timer is `unref`'d so it cannot keep the process
+alive after the client has gone. If the server *is* emitting but the endpoint is
+refusing the rows, it says so once on stderr with the reason — which is the
+point of emitting from here rather than from a detached background request.
 
 ## Real-time Notifications
 

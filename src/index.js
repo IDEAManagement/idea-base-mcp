@@ -8,6 +8,12 @@
  * update_task_status, log_time, and listen for real-time events.
  */
 
+// node:crypto only — for a session id fallback when the client does not supply
+// one. Deliberately the ONLY node built-in this server imports: there is still
+// no `fs` and no `child_process`, which is a documented property in
+// SECURITY-REVIEW.md and not an accident.
+import { randomUUID } from 'node:crypto';
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -78,6 +84,181 @@ if (!API_KEY) {
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 const MAX_ERROR_CHARS = 300;
+
+// ---------------------------------------------------------------------------
+// SESSION HEARTBEATS — why this lives in the MCP server and not in a hook.
+// GitHub issue IDEAManagement/idea-base.us#380.
+// ---------------------------------------------------------------------------
+// `POST /api/heartbeat` and the dashboard's agent board shipped without
+// anything that reliably emits. A `PostToolUse` hook existed, was registered,
+// and fired on every tool call for four and a half hours across five sessions —
+// and wrote ZERO rows, because a hook knows only a GitHub issue number, the
+// endpoint turns that into a task through `tasks.github_issue_id`, and that
+// column was unwritable from any tool an agent had. The endpoint answered 202
+// (correctly: a session outside any tracked task is the normal case) and the
+// hook discarded the response (correctly: it must never wait on the network).
+// Three locally-right decisions composed into a feature that could not report
+// its own failure.
+//
+// This server is a better emitter than a hook on every axis that mattered:
+//
+//   * IT KNOWS THE TASK. `start_working` is the session telling us what it is
+//     working on. `task_id` is a one-hop anchor and the only one that has ever
+//     resolved. No `github_issue_id` bridge, no four-layer field.
+//   * IT KNOWS THE ACTOR. `X-On-Behalf-Of: AGENT_ID` already goes out on every
+//     request, so rows land as the agent and are visible on the agents-only
+//     board. The hook defaulted to unset and attributed agents' work to a human.
+//   * IT CAN SEE THE ANSWER. A heartbeat here is a normal `apiRequest`, so
+//     `recorded:false` and its reason are readable and get logged to stderr
+//     (the client's MCP log). This is the observer whose absence IS the defect.
+//   * IT NEEDS NO INSTALL STEP. Anything that has this server has this, with no
+//     `settings.json` edit, no `postinstall`, and no hook registration. That is
+//     #380 criterion 7, satisfied by there being nothing to configure.
+//   * ITS LIFETIME IS THE SESSION'S LIFETIME. The process is spawned with the
+//     client and dies with it, so "is this session alive" is a direct
+//     measurement rather than the `tasks.status` inference #369 set out to
+//     remove.
+//
+// WHAT IT DELIBERATELY DOES NOT DO: it writes NOTHING to the filesystem. No
+// settings file is read or modified, nothing is created outside this process.
+// `SECURITY-REVIEW.md`'s "Filesystem access — N/A. The server does no fs work;
+// it is stdio + fetch only" remains true, and the question "what happens if the
+// file already has hooks it did not author" never has to be answered because
+// there is no file. A package that edits `~/.claude/settings.json` on install is
+// supply-chain-shaped behaviour and this one is published with provenance and a
+// three-entry file allowlist specifically so that nothing like that travels.
+//
+// The tradeoff, stated rather than buried: this sees its own tool calls plus its
+// own lifetime, NOT every `Bash` and `Edit` the way a `PostToolUse` hook does.
+// The repo-local hook remains the fine-grained emitter where it is registered;
+// this is the one that works everywhere.
+const HEARTBEAT_DISABLED = ['off', '0', 'false', 'no'].includes(
+  (process.env.IDEA_BASE_HEARTBEAT || '').trim().toLowerCase()
+);
+
+// 60s matches the hook's throttle and the board's poll interval. Floored at 10s
+// so a misconfiguration cannot turn this into a request loop.
+const HEARTBEAT_INTERVAL_MS = Math.max(
+  10_000,
+  (Number(process.env.IDEA_BASE_HEARTBEAT_INTERVAL_SECONDS) || 60) * 1000
+);
+
+// The REAL harness session id, when the client provides one.
+//
+// Claude Code puts `CLAUDE_CODE_SESSION_ID` in the environment of the MCP
+// servers it spawns — verified by reading /proc/<pid>/environ of a live server,
+// not assumed from documentation. That is the same id the hook extracts from its
+// stdin payload, so a row from this server and a row from the hook describe the
+// same session under the same name instead of two half-sessions.
+//
+// Other clients (Cursor, Windsurf) set no such variable, so the fallback is a
+// random id with an `mcp-` prefix. The prefix is deliberate: it must be obvious
+// in the data that the id names this process rather than a harness session, so
+// nobody later reads a synthetic id as evidence of something it is not.
+const HARNESS_SESSION_ID =
+  (process.env.CLAUDE_CODE_SESSION_ID || '').trim() ||
+  `mcp-${randomUUID()}`;
+
+// The worktree / project directory, for provenance only. Same shape the hook
+// sends as `spoke`, so the two agree.
+const SPOKE_NAME = (() => {
+  const dir = (process.env.CLAUDE_PROJECT_DIR || process.cwd() || '').trim();
+  if (!dir) return null;
+  const base = dir.split('/').filter(Boolean).pop();
+  return base ? base.slice(0, 200) : null;
+})();
+
+// Mutable session state. `heartbeatTaskId` is set by start_working and cleared by
+// stop_working — it is the session's own declaration of what it is doing, which
+// is exactly what makes this anchor trustworthy.
+let heartbeatTaskId = null;
+let heartbeatTimer = null;
+let heartbeatLastSentAt = 0;
+let heartbeatWarned = false;
+
+// Post one heartbeat. NEVER throws, NEVER returns a rejected promise, and is
+// never awaited by a tool handler.
+//
+// A heartbeat is telemetry about the work; it is not the work. If it fails, the
+// tool the agent actually called must still succeed with its real result, so
+// every failure here is swallowed after being written to stderr. The stamp is
+// taken BEFORE the await so two concurrent calls cannot both decide to fire.
+async function sendHeartbeat(event, taskId) {
+  if (HEARTBEAT_DISABLED) return;
+  if (!taskId) return;
+  heartbeatLastSentAt = Date.now();
+  try {
+    const res = await apiRequest('/heartbeat', {
+      method: 'POST',
+      body: JSON.stringify({
+        event,
+        session_id: HARNESS_SESSION_ID,
+        task_id: taskId,
+        ...(SPOKE_NAME ? { spoke: SPOKE_NAME } : {}),
+      }),
+    });
+    // The whole point of emitting from here rather than from a detached curl:
+    // a refusal is VISIBLE. Logged once per process so a persistent
+    // misconfiguration is reported without turning the log into a stream.
+    if (res && res.recorded === false && !heartbeatWarned) {
+      heartbeatWarned = true;
+      console.error(
+        `IDEA Base heartbeat not recorded (reason: ${res.reason || 'unknown'}). ` +
+        'Session activity will not appear on the dashboard agent board.'
+      );
+    } else if (res && res.recorded === true && res.actor_is_agent === false && !heartbeatWarned) {
+      heartbeatWarned = true;
+      console.error(
+        `IDEA Base heartbeat recorded but attributed to a non-agent identity ` +
+        `(${res.actor_id}). The dashboard agent board is agents-only, so this ` +
+        'session will not appear on it.'
+      );
+    }
+  } catch (error) {
+    if (!heartbeatWarned) {
+      heartbeatWarned = true;
+      console.error(`IDEA Base heartbeat failed: ${redact(error?.message || 'unknown error')}`);
+    }
+  }
+}
+
+// Begin heartbeating a task. Idempotent: calling start_working twice must not
+// produce two timers, the same way it must not open two work sessions.
+function startHeartbeat(taskId) {
+  if (HEARTBEAT_DISABLED || !taskId) return;
+  heartbeatTaskId = taskId;
+  void sendHeartbeat('start', taskId);
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    void sendHeartbeat('tool', heartbeatTaskId);
+  }, HEARTBEAT_INTERVAL_MS);
+  // unref so a live timer can never be the reason this process outlives the
+  // client that spawned it. A heartbeat must not keep a dead session alive —
+  // that is the exact lie the feature exists to prevent.
+  heartbeatTimer.unref?.();
+}
+
+function stopHeartbeat() {
+  const taskId = heartbeatTaskId;
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  heartbeatTaskId = null;
+  if (taskId) void sendHeartbeat('stop', taskId);
+}
+
+// Called after every tool this server serves. Throttled, and the throttle is
+// checked before anything else, so the common case costs one comparison.
+//
+// Why both this and the timer: the timer alone would measure only that the
+// process is alive, and real tool activity should move `observed_at` forward the
+// moment it happens rather than up to a minute later.
+function noteHeartbeatActivity() {
+  if (HEARTBEAT_DISABLED || !heartbeatTaskId) return;
+  if (Date.now() - heartbeatLastSentAt < HEARTBEAT_INTERVAL_MS) return;
+  void sendHeartbeat('tool', heartbeatTaskId);
+}
 
 // Belt-and-braces: nothing we emit should ever contain the key, but a stray
 // stack frame or an echoing upstream must not be the thing that proves it.
@@ -497,6 +678,14 @@ const tools = [
           type: 'string',
           description: 'URL of the GitHub Pull Request implementing this task. Used to fetch the PR diff for AI verification and to match incoming CI status (check_run/check_suite/workflow_run webhooks) back to this task.',
         },
+        github_issue_id: {
+          type: 'string',
+          description: 'The GitHub ISSUE NUMBER this task tracks, e.g. "380" — just the number, not a URL. SET THIS WHENEVER THE TASK CORRESPONDS TO AN ISSUE. It is not bookkeeping: tasks.github_issue_id is the ONLY join POST /api/heartbeat has for turning a working session\'s issue number into a task, so a task without it cannot receive session heartbeats and the session will not appear on the dashboard agent board. This field was missing from this server entirely until #380, which is why only 60 of 1,681 tasks carry it and why no agent session had ever recorded a heartbeat.',
+        },
+        github_issue_url: {
+          type: 'string',
+          description: 'Full URL of the GitHub issue this task tracks. Provenance for a human reading the task; the heartbeat join uses github_issue_id, so set that too.',
+        },
         sort_order: {
           type: 'number',
           description: 'Position among the project\'s tasks (lower sorts first). NOT wired on the REST create path — POST /api/projects/:id/tasks always assigns MAX(sort_order)+1 and ignores this field on create. Set it after creation with update_task instead.',
@@ -564,6 +753,14 @@ const tools = [
         github_pr_url: {
           type: 'string',
           description: 'URL of the GitHub Pull Request implementing this task. Used to fetch the PR diff for AI verification and to match incoming CI status back to this task. Pass an empty string to clear it.',
+        },
+        github_issue_id: {
+          type: 'string',
+          description: 'The GitHub ISSUE NUMBER this task tracks, e.g. "380" — just the number, not a URL. Pass an empty string to unlink. Set this on any task that corresponds to an issue: tasks.github_issue_id is the ONLY join POST /api/heartbeat has for resolving a session\'s issue number to a task, so a task without it cannot receive session heartbeats and its agent will not appear on the dashboard agent board. REQUIRES the server-side fix from idea-base.us#380 — PUT /api/tasks/:id had no branch for this field before then and silently discarded it while reporting success.',
+        },
+        github_issue_url: {
+          type: 'string',
+          description: 'Full URL of the GitHub issue this task tracks. Pass an empty string to clear it. Provenance only; the heartbeat join uses github_issue_id.',
         },
         sort_order: {
           type: 'number',
@@ -1220,7 +1417,7 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url, github_issue_id, github_issue_url, sort_order, is_milestone, required_ci_checks }) {
     // sort_order, is_milestone and required_ci_checks are forwarded for parity
     // with update_task, but POST /api/projects/:id/tasks does not destructure
     // any of the three — it always assigns MAX(sort_order)+1 and leaves
@@ -1240,6 +1437,12 @@ const toolHandlers = {
         parent_task_id,
         verification_mode,
         github_pr_url,
+        // #380. These two ARE destructured by POST /api/projects/:id/tasks
+        // (projects/[id]/tasks.js:204) — unlike the three no-ops noted above —
+        // so this is a real write and the only moment the issue link could be
+        // set at all before the PUT path gained it.
+        github_issue_id,
+        github_issue_url,
         sort_order,
         is_milestone,
         required_ci_checks,
@@ -1255,7 +1458,7 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url, github_issue_id, github_issue_url, sort_order, is_milestone, required_ci_checks }) {
     // Only forward what the caller actually named. An absent key leaves the
     // field alone; an explicitly empty string is how a date, the assignee or
     // the PR link is cleared, and blocked_by is a REPLACE so an explicit []
@@ -1275,6 +1478,13 @@ const toolHandlers = {
     if (blocked_reason !== undefined) updates.blocked_reason = blocked_reason;
     if (verification_mode !== undefined) updates.verification_mode = verification_mode;
     if (github_pr_url !== undefined) updates.github_pr_url = github_pr_url;
+    // #380. Needs the matching server fix to actually land: before it, PUT
+    // /api/tasks/:id never destructured these, so the request succeeded, the
+    // response looked right, and the column was untouched. Against an old
+    // deployment this is a silent no-op — check the returned task, which is what
+    // caught it.
+    if (github_issue_id !== undefined) updates.github_issue_id = github_issue_id;
+    if (github_issue_url !== undefined) updates.github_issue_url = github_issue_url;
     if (sort_order !== undefined) updates.sort_order = sort_order;
     if (is_milestone !== undefined) updates.is_milestone = is_milestone;
     if (required_ci_checks !== undefined) updates.required_ci_checks = required_ci_checks;
@@ -1518,6 +1728,18 @@ const toolHandlers = {
       timing = `\n\n(Work session NOT recorded: ${error.message} — your presence flag is set, but no duration will be measured for this stretch.)`;
     }
 
+    // #380. THIS CALL IS THE SESSION TELLING US WHAT IT IS WORKING ON, which is
+    // the one piece of information the heartbeat hook never had and could not
+    // get. Start emitting from here.
+    //
+    // Deliberately AFTER the presence and session writes and never awaited: a
+    // heartbeat is telemetry about the work and must not be able to change
+    // whether start_working succeeded. It is also outside the try/catch above on
+    // purpose — startHeartbeat cannot throw, and folding it in would let a
+    // future edit turn a telemetry failure into "Work session NOT recorded",
+    // which would be a lie about the thing that did succeed.
+    startHeartbeat(task_id);
+
     // Orient a cold-starting session: surface the resume context + recent work notes.
     let orientation = '';
     try {
@@ -1612,6 +1834,16 @@ const toolHandlers = {
     await apiRequest(`/tasks/${task_id}/assignments?stop_only=true`, {
       method: 'DELETE',
     });
+
+    // #380. Stop the timer and post a final `stop`, so the board drops this
+    // session within one interval BECAUSE THE HEARTBEATS STOPPED — not because a
+    // status changed. That distinction is the whole design of #369, and it is
+    // what lets a live agent on an already-closed task still show as alive.
+    //
+    // Note this runs even when the session close above failed: the heartbeats
+    // must not outlive the agent's declared intent to stop, whatever the
+    // work-session endpoint did.
+    stopHeartbeat();
 
     const capturedText = captured.length ? ` Saved ${captured.join(' and ')} for next time.` : '';
     return {
@@ -1878,7 +2110,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const safeArgs = validateArgs(name, tool.inputSchema, args);
-    return await handler(safeArgs);
+    const result = await handler(safeArgs);
+    // #380. Real activity moves `observed_at` forward the moment it happens,
+    // rather than waiting up to a full interval for the timer. Throttled, never
+    // awaited, and AFTER the handler has produced its result so it cannot affect
+    // it. Placed inside the try only so that a (impossible) throw from here
+    // would still be redacted rather than crashing the server.
+    noteHeartbeatActivity();
+    return result;
   } catch (error) {
     return {
       content: [
@@ -2226,11 +2465,38 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   }
 });
 
+// #380. A best-effort `stop` when the client goes away without calling
+// stop_working — which is the NORMAL ending, not an exception: an agent session
+// ends when its context ends, and nothing calls stop_working on the way out.
+// (idea-base.us's own abandoned-session sweep exists because of exactly that.)
+//
+// This is best-effort and nothing more. SIGKILL, a dead container or a severed
+// pipe will all skip it, which is precisely why the server-side sweep must keep
+// existing and why `stop` is a courtesy rather than the mechanism. The thing
+// that actually makes a vanished session disappear from the board is that the
+// heartbeats STOP arriving.
+//
+// `stdin` closing is the reliable signal for a stdio transport: the client's
+// pipe shuts before the signals arrive, or instead of them.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    stopHeartbeat();
+    // Do not swallow the signal — exit with the conventional code so the
+    // supervisor sees what it expects.
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
+}
+process.stdin.on('end', () => { stopHeartbeat(); });
+process.stdin.on('close', () => { stopHeartbeat(); });
+
 // Start the server
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('IDEA Base MCP Server running on stdio');
+  if (HEARTBEAT_DISABLED) {
+    console.error('IDEA Base heartbeats: DISABLED (IDEA_BASE_HEARTBEAT)');
+  }
 }
 
 main().catch((error) => {
