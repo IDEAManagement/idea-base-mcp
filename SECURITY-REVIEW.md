@@ -43,7 +43,9 @@ Legend: **Fixed** (changed in this pass) · **Accepted** (understood, no change)
 | `child_process` | **N/A** — not imported. |
 | `eval` / `new Function` | **N/A** — not present. |
 | Dynamic `import()` from arguments | **N/A** — all imports are static and literal. |
-| Filesystem access | **N/A** — the server does no `fs` work; it is stdio + fetch only. |
+| Filesystem access | **N/A** — the server does no `fs` work; it is stdio + fetch only. Re-confirmed for 2.6.0: session heartbeats add no filesystem access of any kind, write no settings file, and register no hook. `grep -nE "node:fs\|'fs'\|child_process\|writeFileSync\|mkdirSync"` is still zero. |
+| Node built-ins imported | **`node:crypto` only** (added 2.6.0, for `randomUUID` — a session-id fallback when the client sets no `CLAUDE_CODE_SESSION_ID`). Called with no arguments and its output is never interpolated into a URL path or a shell. |
+| Outbound requests added in 2.6.0 | `POST /api/heartbeat` on the same host, with the same key and `X-On-Behalf-Of`, through the same `apiRequest` (so `redirect: 'error'` and the response cap apply). Body is the event name, task id, session id and project-directory basename — **no tool names, no tool arguments, no file contents**. Disable with `IDEA_BASE_HEARTBEAT=off`. |
 
 ## Fetch hygiene
 

@@ -1,5 +1,65 @@
 # Changelog
 
+## 2.6.0 — 2026-11-03
+
+**Session heartbeats, emitted from here instead of from a hook that could not
+work.** IDEA Base's dashboard agent board shipped with no reliable emitter: a
+`PostToolUse` hook existed, was registered, fired on every tool call across five
+sessions for four and a half hours, and wrote **zero** rows. It knew only a
+GitHub issue number; the endpoint resolves that through `tasks.github_issue_id`;
+and that column could not be written by any tool an agent had — including this
+server, which had no reference to it in 2,239 lines. The endpoint answered 202
+(correctly — a session outside any tracked task is the normal case) and the hook
+detached its POST (correctly — it must never wait on the network), so the only
+party told the outcome was the party that threw it away.
+
+This server is the better emitter, and needs no install step to become one.
+
+### Added
+
+- **Session heartbeats.** After `start_working`, the server posts `start`, then
+  `tool` every `IDEA_BASE_HEARTBEAT_INTERVAL_SECONDS` (default 60, floor 10) and
+  on each tool call it serves (throttled to the same interval), then `stop` on
+  `stop_working` or when the client's pipe closes. Anchored on **`task_id`** —
+  one hop, and the only anchor the endpoint has ever resolved — and attributed
+  with the `X-On-Behalf-Of` identity already sent on every request, so rows land
+  as the agent and are visible on the agents-only board.
+- **`IDEA_BASE_HEARTBEAT=off`** (also `0`/`false`/`no`) disables them entirely,
+  confirmed on stderr at startup. **`IDEA_BASE_HEARTBEAT_INTERVAL_SECONDS`**
+  tunes the interval.
+- **`github_issue_id` and `github_issue_url` on `create_task` and
+  `update_task`.** This is the field whose absence made the whole feature
+  unreachable: 60 of 1,681 tasks carried it, all of them GitHub imports, because
+  no agent-facing tool could set it. `update_task` additionally requires the
+  server-side fix in idea-base.us#380 — before it, `PUT /api/tasks/:id` never
+  destructured the field and silently discarded it while reporting success.
+
+### Notes
+
+- **Nothing is written to your filesystem, on install or at runtime.** There is
+  no `postinstall`, no hook registration, no `settings.json` is read or
+  modified. `SECURITY-REVIEW.md`'s "Filesystem access — N/A. The server does no
+  `fs` work; it is stdio + fetch only" remains true. The one new built-in import
+  is `node:crypto`, for a session-id fallback.
+- A `postinstall` was considered and rejected: it does not run under
+  `--ignore-scripts` and `npx -y …@latest` caches, so it would run for some
+  consumers and silently not for others — which is the defect class this release
+  exists to remove, not a way to fix it.
+- **The tradeoff:** this sees its own tool calls plus its own lifetime, not
+  every `Bash` and `Edit` the way a `PostToolUse` hook does. It measures that a
+  session is alive and working a declared task, which is a direct measurement
+  rather than the task-status inference it replaces. A repo-local hook remains
+  the finer-grained emitter where one is registered.
+- A heartbeat can never fail a tool call: never awaited, all errors swallowed
+  after one stderr line, and the timer is `unref`'d so it cannot keep the
+  process alive past the client.
+- The session id is `CLAUDE_CODE_SESSION_ID` when the client sets it (Claude
+  Code does — verified by reading a live server's `/proc/<pid>/environ`, not
+  assumed from docs), so a row from this server and a row from the hook describe
+  the same session. Other clients get a random `mcp-<uuid>`; the prefix is
+  deliberate, so a synthetic id is never mistaken in the data for a harness one.
+
+
 ## 2.5.0 — 2026-10-19
 
 Three **prompts**. Until now this server shipped 35 tools and nothing else, so
