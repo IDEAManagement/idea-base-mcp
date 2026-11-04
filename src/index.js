@@ -486,7 +486,7 @@ const tools = [
         },
         parent_task_id: {
           type: 'number',
-          description: 'Make this a SUBTASK of the given task. The parent must be in the same project, and a subtask cannot itself have subtasks (one level only). A parent with subtasks takes its status from them: any subtask in progress makes the parent in progress, and all subtasks done makes it ready to complete.',
+          description: 'Make this a SUBTASK of the given task. The parent must be in the same project, and a subtask cannot itself have subtasks (one level only). A parent with subtasks takes its status from them: any subtask in progress makes the parent in progress, and all subtasks done makes it ready to complete. AND IT HOLDS THE PARENT OPEN (GH #387): while this subtask is not done, marking the parent done is REFUSED with 403 OPEN_SUBTASKS — the roll-up used to be display-only and now has teeth. That is the point of filing an adjacent finding as a subtask rather than as a separate task. Re-parenting an existing task is update_task\'s parent_task_id.',
         },
         verification_mode: {
           type: 'string',
@@ -587,13 +587,33 @@ const tools = [
           type: 'string',
           description: 'Free-text reason shown next to a manually-set Blocked status ("waiting on the client"). Cleared automatically when the task leaves the blocked status.',
         },
+        parent_task_id: {
+          // ['number','null'] and NOT 'number'. `null` is the only way to
+          // DETACH a subtask back to top level, and a bare 'number' schema
+          // drops it before the handler sees it — measured against production
+          // 2026-11-04: update_task(parent_task_id: null) answered "No fields
+          // to update" while the same null over REST detached correctly. A
+          // re-parenting tool that cannot un-parent just moves the trap along.
+          type: ['number', 'null'],
+          description: 'RE-PARENT this existing task: make it a subtask of the given task, or pass null to detach it back to top level. Until GH #387 this was settable only at creation (create_task), which meant a finding recognised as adjacent AFTER it was written down could not be filed under the task that found it. The parent must be in the SAME project, cannot itself be a subtask, and THIS task must not already have subtasks of its own — nesting is one level only, and each of those is refused with a 400 naming what is in the way rather than silently producing a grandchild. Note that parenting a task immediately stops its parent closing: a parent with any subtask that is not done is refused (403 OPEN_SUBTASKS) by PUT /api/tasks/:id/status.',
+        },
+        github_issue_id: {
+          // Same reason as parent_task_id above: null UNLINKS, and a bare
+          // 'number' schema would make the link one-way.
+          type: ['number', 'string', 'null'],
+          description: 'The GitHub issue number this task tracks (pass null or an empty string to unlink). LOAD-BEARING, not bookkeeping: session_heartbeats.task_id is NOT NULL and the heartbeat endpoint resolves a session\'s GitHub issue number to a task through tasks.github_issue_id — so a session working an issue whose task lacks this column emits heartbeats that have nowhere to land and is invisible on the live agent board. Writable over REST since #384; this tool could not send it until GH #387, which is why it had to be set with a hand-rolled curl.',
+        },
+        github_issue_url: {
+          type: 'string',
+          description: 'Full URL of the GitHub issue this task tracks. Pass an empty string to clear it. Set it alongside github_issue_id so the two cannot disagree.',
+        },
       },
       required: ['task_id'],
     },
   },
   {
     name: 'update_task_status',
-    description: 'Change the status of a task (todo, in_progress, blocked, done). This triggers a real-time notification to users viewing the project. Note that a task with subtasks or dependencies also has a DERIVED status which can differ from the one set here — see effective_status / status_reason on get_task.',
+    description: 'Change the status of a task (todo, in_progress, blocked, done). This triggers a real-time notification to users viewing the project. Note that a task with subtasks or dependencies also has a DERIVED status which can differ from the one set here — see effective_status / status_reason on get_task.\n\nSETTING "done" IS GATED (GH #387). A task holding any subtask that is not done is REFUSED with 403 OPEN_SUBTASKS, naming the blocking children. The bar is "done": a subtask that is todo, in progress or blocked all refuse it for the same reason. This is not advisory and there is no automated way around it — the override is reserved for a human account owner or admin, and an automated identity is refused it explicitly (403 FORCE_NOT_PERMITTED, reason actor_is_agent). So finish the subtasks; do not attempt to force the parent.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1255,7 +1275,7 @@ const toolHandlers = {
     };
   },
 
-  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks }) {
+  async update_task({ task_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, blocked_by, blocked_reason, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks, parent_task_id, github_issue_id, github_issue_url }) {
     // Only forward what the caller actually named. An absent key leaves the
     // field alone; an explicitly empty string is how a date, the assignee or
     // the PR link is cleared, and blocked_by is a REPLACE so an explicit []
@@ -1278,6 +1298,14 @@ const toolHandlers = {
     if (sort_order !== undefined) updates.sort_order = sort_order;
     if (is_milestone !== undefined) updates.is_milestone = is_milestone;
     if (required_ci_checks !== undefined) updates.required_ci_checks = required_ci_checks;
+    // GH #387. Both of these follow the same `!== undefined` rule as everything
+    // above, and for both an explicit `null` is a REAL value the API acts on —
+    // null detaches a subtask, and null unlinks a GitHub issue. Collapsing
+    // either to truthiness would remove the only way to undo them, which is how
+    // a re-parenting fix would just move the trap one step along.
+    if (parent_task_id !== undefined) updates.parent_task_id = parent_task_id;
+    if (github_issue_id !== undefined) updates.github_issue_id = github_issue_id;
+    if (github_issue_url !== undefined) updates.github_issue_url = github_issue_url;
 
     const task = await apiRequest(`/tasks/${task_id}`, {
       method: 'PUT',
