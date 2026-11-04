@@ -588,11 +588,19 @@ const tools = [
           description: 'Free-text reason shown next to a manually-set Blocked status ("waiting on the client"). Cleared automatically when the task leaves the blocked status.',
         },
         parent_task_id: {
-          type: 'number',
+          // ['number','null'] and NOT 'number'. `null` is the only way to
+          // DETACH a subtask back to top level, and a bare 'number' schema
+          // drops it before the handler sees it — measured against production
+          // 2026-11-04: update_task(parent_task_id: null) answered "No fields
+          // to update" while the same null over REST detached correctly. A
+          // re-parenting tool that cannot un-parent just moves the trap along.
+          type: ['number', 'null'],
           description: 'RE-PARENT this existing task: make it a subtask of the given task, or pass null to detach it back to top level. Until GH #387 this was settable only at creation (create_task), which meant a finding recognised as adjacent AFTER it was written down could not be filed under the task that found it. The parent must be in the SAME project, cannot itself be a subtask, and THIS task must not already have subtasks of its own — nesting is one level only, and each of those is refused with a 400 naming what is in the way rather than silently producing a grandchild. Note that parenting a task immediately stops its parent closing: a parent with any subtask that is not done is refused (403 OPEN_SUBTASKS) by PUT /api/tasks/:id/status.',
         },
         github_issue_id: {
-          type: 'number',
+          // Same reason as parent_task_id above: null UNLINKS, and a bare
+          // 'number' schema would make the link one-way.
+          type: ['number', 'string', 'null'],
           description: 'The GitHub issue number this task tracks (pass null or an empty string to unlink). LOAD-BEARING, not bookkeeping: session_heartbeats.task_id is NOT NULL and the heartbeat endpoint resolves a session\'s GitHub issue number to a task through tasks.github_issue_id — so a session working an issue whose task lacks this column emits heartbeats that have nowhere to land and is invisible on the live agent board. Writable over REST since #384; this tool could not send it until GH #387, which is why it had to be set with a hand-rolled curl.',
         },
         github_issue_url: {
