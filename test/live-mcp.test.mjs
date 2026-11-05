@@ -64,7 +64,21 @@ function toolResultJson(result) {
     throw err;
   }
   const text = result.content?.[0]?.text;
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    // As of idea-base-mcp main (post-2.6.0, #383's setup/features work), the
+    // FIRST tool call of a session may have a plain-text first-use nudge
+    // appended after the JSON ("\n\nThis project is not emitting..."). That
+    // is fine for an LLM reading prose, but it breaks a strict parse — which
+    // is exactly what this script does, so tolerate it rather than treat it
+    // as a false failure: take the longest valid-JSON prefix.
+    const nudgeIdx = text.indexOf('\n\n');
+    if (nudgeIdx > 0) {
+      try { return JSON.parse(text.slice(0, nudgeIdx)); } catch { /* fall through */ }
+    }
+    throw err;
+  }
 }
 
 async function main() {
