@@ -1,0 +1,61 @@
+name: test
+
+# A test suite nothing runs is the failure mode this project has already paid
+# for twice: CI green over a dead emitter, and a 29-assertion suite that had
+# been dead since the day it was written. The suite added in 2.6.0 is the first
+# in this repository, so it gets a workflow in the same change rather than a
+# follow-up that never happens.
+#
+# No dependency is installed to run it. The tests import only node: builtins and
+# the package's own modules - the MCP SDK is needed by src/index.js and by
+# nothing under test - so `npm ci` is deliberately absent and the job stays a
+# few seconds long.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # SHAs reused from .github/workflows/publish.yml rather than recalled, so
+      # this workflow pins exactly what the repository already trusts.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # The package's own floor is >=20. Testing on it rather than on
+          # latest is the point: `node --test` and the APIs these modules use
+          # must work for a customer on the oldest version we claim to support.
+          node-version: '20'
+
+      - name: Run the test suite
+        run: npm test
+
+      - name: Verify the packaged artifact contains what install needs
+        # The silent footgun: package.json "files" decides what npm actually
+        # publishes, so a vendored asset left out of it is absent for every
+        # customer while working perfectly from a git checkout - and installing
+        # hooks that point at a missing script fails CLOSED. A test asserts the
+        # list; this asserts the TARBALL, which is the thing that ships.
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e '
+            const files = require("/tmp/pack.json")[0].files.map(f => f.path);
+            const required = [
+              "src/index.js", "src/cli.js", "src/setup.js",
+              "src/features.js", "src/render.js",
+              "src/assets/heartbeat.sh", "src/assets/heartbeat.provenance.json",
+            ];
+            const missing = required.filter(f => !files.includes(f));
+            if (missing.length) {
+              console.error("Not in the tarball:\n  " + missing.join("\n  "));
+              process.exit(1);
+            }
+            console.log("tarball carries all " + required.length + " required files");
+          '

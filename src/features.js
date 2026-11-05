@@ -270,11 +270,21 @@ export function buildInventory({ local, assess, remote }) {
   // "available / not available in this project" is the question the issue asks,
   // and availability genuinely changed recently, so it is reported as a
   // capability of the running server rather than as a fixed yes.
+  // MEASURED, after an earlier revision of this row overstated it. The claim
+  // "create_task and update_task both accept github_issue_id" was written from
+  // belief and is false: `github_issue_id` appears in `update_task`'s schema
+  // only. Passing it to `create_task` is silently discarded - the tool reports
+  // success and the column reads back null, which is how this very task was
+  // created before the value had to be set over REST.
+  //
+  // Reported as a two-step capability rather than a yes, because a customer who
+  // anchors heartbeats by issue number and creates tasks through `create_task`
+  // would otherwise get `issue_not_resolved` forever with nothing saying why.
   rows.push(row({
     key: 'issue_link',
     name: 'Task <-> GitHub issue linking (github_issue_id)',
     state: STATE.ON,
-    detail: 'available: create_task and update_task both accept github_issue_id in this server version. It is load-bearing for heartbeats anchored by issue number - the endpoint resolves an issue to a task through this column.',
+    detail: 'available through update_task. NOT through create_task - the field is absent from its schema and is silently discarded, so a new task needs create_task followed by update_task (or a REST PUT). Load-bearing for heartbeats anchored by issue number: the endpoint resolves an issue to a task through this column, and a task without it collects pings that have nowhere to land.',
     lastDataNote: 'no endpoint reports linkage coverage - there is no count, no ratio, no linked_at column and no linked/unlinked filter, so "how much of this project is linked" can only be computed by listing every task',
     source: 'this server\'s tool schema',
   }));
