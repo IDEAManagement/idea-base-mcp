@@ -1,5 +1,69 @@
 # Changelog
 
+## 2.7.0 — 2026-11-05
+
+**The product now instructs you to use it.** Installing IDEA Base gave you
+working session-tracking mechanisms and nothing that told you they existed or
+wired up what they need. We were the first customer and proved it: a full day
+of work in our own repository recorded no task, no work session and no time,
+with the live agent board empty of every session actually running.
+
+Tracks `idea-base.us#383`.
+
+### Added
+
+- **`/idea-base:setup`** — reports whether this project emits session tracking,
+  names every missing piece with the **literal text to add**, and takes a live
+  probe so the answer is "a row landed" rather than "a hook is registered".
+  Writes nothing. Re-runnable at any time, and re-running **is** the audit —
+  there is no separate audit command to drift from it.
+- **`/idea-base:features`** — what is wired on **this machine**, not what the
+  product supports. Four states per capability: on, off, configured-but-not-
+  firing, and undetermined. Read-only.
+- **`install` / `doctor` / `features` CLI subcommands.** The spec has no
+  primitive for writing a customer's settings file, so the prompt recommends and
+  `install` writes, only with `--apply`.
+  - It **merges**: other tools' hooks, `permissions`, `env` and every unrelated
+    key survive. A second run leaves the file byte-identical.
+  - It **collapses a duplicate** heartbeat registration — a duplicate
+    double-writes.
+  - It **refuses a `settings.json` it cannot parse** rather than rewriting it. A
+    file that will not parse is not an empty file.
+  - It writes the hook script **before** the hooks that reference it, because a
+    hook pointing at a missing script fails *closed* and can deny `Bash` and
+    `Edit`, including the edit needed to repair it.
+  - `--actor` is **never defaulted**. Unset writes a mislabelled but visible
+    row; a wrong id is refused and writes **no row at all**.
+- **A first-use pointer** on the first tool call of a session — once per
+  process, and only when tracking is actually missing. There is no sanctioned
+  run-on-install moment: the lifecycle forbids a server speaking before
+  `initialized`, no hook fires on MCP connection, and the `Setup` hook event is
+  not it either (it fires only under `--init-only` / `-p --init`, cannot block,
+  and has its output discarded).
+- **`src/assets/heartbeat.sh`** — the hook script now ships with the package,
+  byte-identical to its origin in `idea-base.us`, with provenance recorded
+  beside it. Without it, `setup` would register three hooks pointing at a file
+  the customer does not have.
+- **A test suite — the first in this repository.** 56 assertions on
+  `node --test` (built into Node 20+; no dependency added). `npm test`.
+
+### Fixed
+
+- `serverInfo.version` reported `1.0.0` while the package was at `2.5.0`, so the
+  version a client displayed bore no relation to the one installed. Now
+  asserted against `package.json` by a test.
+
+### Notes
+
+Three defects in this work were caught by its own tests and its own
+end-to-end run rather than by review: the injected filesystem was being
+bypassed for writes (so "a dry run writes nothing" was asserting against the
+real disk); a capability row carried no timestamp and no reason, which is the
+shape this release exists to forbid; and `doctor` redirected `TMPDIR` without
+redirecting the hook's **state** dir, so it reported NOT TRACKED for a session
+whose anchor was perfectly resolvable — a false negative telling a correctly
+configured customer their tracking was broken. Each now has a regression test.
+
 ## 2.6.0 — 2026-11-05
 
 Ships seventeen days of merged work that had never been published (GH #410) —

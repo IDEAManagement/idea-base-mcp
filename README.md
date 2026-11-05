@@ -86,9 +86,92 @@ server in your MCP config.
 | `/idea-base:start_sprint [id]` | A sprint laid out to work: goal, window, days left, and items split into assigned-to-you / unassigned / blocked-with-reason. Omit the id for the sprint covering today. |
 | `/idea-base:sprint_report [id]` | Committed vs completed, what carried and how often, from the commitment ledger written at close. |
 | `/idea-base:plan_sprint <product_id>` | Cadence, the next window, the eligible pool, and what is held back as blocked. |
+| `/idea-base:setup` | Whether this project emits session tracking, every missing piece with the literal text to add, and a live check that a heartbeat actually lands. Writes nothing. |
+| `/idea-base:features` | What is wired on **this machine** — each capability on, off, configured-but-not-firing, or undetermined with the reason. Read-only. |
 
 Tracker text in these results is fenced as data, and item lists are capped with
 the true total printed.
+
+## Session tracking
+
+With it installed, a long-running agent session appears on the dashboard's
+**Agents Working Now** board while it works and leaves within seconds of
+ending. Without it the board is empty, and **there is no way to tell that from
+"no agents are running"** — which is the failure this exists to prevent.
+
+```sh
+npx @idea-base/mcp-server install          # DRY RUN — prints the plan, writes nothing
+npx @idea-base/mcp-server install --apply --actor <agent-user-id>
+npx @idea-base/mcp-server doctor           # does a heartbeat actually land?
+npx @idea-base/mcp-server features         # the inventory, read-only
+```
+
+**`install` is safe to run as often as you like.** It merges rather than
+overwrites: your other tools' hooks, your `permissions`, your `env` and
+everything else in `.claude/settings.json` are preserved, and a second run
+leaves the file byte-identical. If it finds the same heartbeat hook registered
+twice it collapses it to one — a duplicate heartbeat double-writes. A
+`settings.json` it cannot parse is **refused, never rewritten**: a file that
+will not parse is not an empty file, and rebuilding it would delete every hook
+you have.
+
+It installs three hooks — `SessionStart`, `PostToolUse`, `SessionEnd` — plus
+the script they call, at `.claude/hooks/heartbeat.sh`. The script is written
+**before** the hooks that reference it, because a hook pointing at a missing
+script fails *closed* and can deny `Bash` and `Edit`, including the edit needed
+to repair it.
+
+### `--actor` is not optional in practice, and is never guessed
+
+The API key belongs to a person. Without `env.IDEABASE_ACTOR` every heartbeat
+an agent posts is attributed to that person, and because the board filters to
+agents, the session is filtered off it entirely.
+
+It is never defaulted, deliberately:
+
+| `IDEABASE_ACTOR` | Result |
+| --- | --- |
+| unset | a row is written, attributed to the key's human owner. Mislabelled, but **visible and fixable**. |
+| an id that does not exist | `403` — **no row at all**. |
+| an id belonging to a human | `403` — no row. |
+
+A wrong guess lands in the invisible row. So `install` asks for it rather than
+inventing one.
+
+### Verifying, and what "verified" means
+
+`doctor` posts one labelled probe and reports **the server's own verdict**, because
+`POST /api/heartbeat` answers `HTTP 202` with `{"recorded":false}` when it
+discards a ping — a success status for "I threw this away". Exit status:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | recorded (or heartbeats are deliberately switched off) |
+| `1` | the endpoint refused or skipped it |
+| `2` | could not get as far as asking |
+
+`1` and `2` are kept apart on purpose: "I asked and was told no" and "I never
+managed to ask" need different fixes.
+
+**A session with no task is untracked, by design.** The hook sends nothing
+unless the session has declared what it is working on — normally by calling
+`start_working`. Nothing about your branch names or directory layout affects
+this. A hub on `main`, an exploratory session, anything not working a task: all
+correctly absent, and `doctor` says which.
+
+### What this does not do
+
+It never changes a task's status. A session ending marks the *session*
+finished; deciding a task is done is a judgment with a verification gate in
+front of it.
+
+These three hooks are **Claude Code** mechanisms. Nothing here transfers to
+another agent harness — `POST /api/heartbeat` is not Claude-Code-specific, so
+you can wire it to any session lifecycle hook yourself, but there is no
+packaged install for another harness today.
+
+Requires `curl` on `PATH`, a **write**-scoped API key, and Node 20+.
+`IDEABASE_HEARTBEAT=off` disables emission entirely.
 
 ### Tasks
 
