@@ -1,0 +1,65 @@
+name: Version drift check
+
+# GH #410: seventeen days of merged work (update_task's parent_task_id and
+# github_issue_id) sat unpublished because nothing said the npm registry had
+# fallen behind main. This workflow is that signal — non-blocking by design,
+# since publishing is a deliberate decision (the CEO correctly deprioritized
+# it on 2026-11-04 to fix live defects first) and a hard-failing check would
+# punish every ordinary commit for a gap this is meant to surface, not force.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Compare main against the published gitHead
+        run: |
+          set -e
+          PUBLISHED_VERSION="$(npm view @idea-base/mcp-server version)"
+          PUBLISHED_GITHEAD="$(npm view @idea-base/mcp-server gitHead || true)"
+          echo "Published: $PUBLISHED_VERSION (gitHead $PUBLISHED_GITHEAD)"
+
+          if [ -z "$PUBLISHED_GITHEAD" ]; then
+            echo "::warning::Could not read gitHead for the published version — skipping drift check."
+            exit 0
+          fi
+
+          if ! git cat-file -e "$PUBLISHED_GITHEAD" 2>/dev/null; then
+            echo "::warning::Published gitHead $PUBLISHED_GITHEAD is not in this history (shallow clone or rewritten history) — skipping drift check."
+            exit 0
+          fi
+
+          AHEAD="$(git rev-list --count "$PUBLISHED_GITHEAD"..HEAD)"
+          {
+            echo "### Version drift check"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Published version | \`$PUBLISHED_VERSION\` |"
+            echo "| Published gitHead | \`$PUBLISHED_GITHEAD\` |"
+            echo "| Commits on main since | **$AHEAD** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$AHEAD" -gt 0 ]; then
+            echo "::warning::main is $AHEAD commit(s) ahead of published v$PUBLISHED_VERSION (gitHead $PUBLISHED_GITHEAD). Merged work is not shipped until a release is cut — see README.md#releasing."
+          else
+            echo "main matches the published version. Nothing to report."
+          fi

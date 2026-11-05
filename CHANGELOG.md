@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.6.0 — 2026-11-05
+
+Ships seventeen days of merged work that had never been published (GH #410) —
+every consumer was still on 2.5.0, so `update_task(parent_task_id)`, the
+re-parenting half of #387, was unreachable in every running session.
+
+### Added
+
+- **`update_task` accepts `parent_task_id`, `github_issue_id`,
+  `github_issue_url`** (idea-base.us#387; merged in `e2ee06c`, unreleased
+  until now). Re-parent an existing task or detach it (`parent_task_id:
+  null`); link or unlink the GitHub issue a task tracks
+  (`github_issue_id: null`). Both follow the `!== undefined` rule used
+  elsewhere in this tool: an explicit `null` is a real value the API acts
+  on, not a no-op.
+- **`create_task` accepts `github_issue_id` / `github_issue_url`.** This was
+  the missing fourth layer: the REST create path
+  (`POST /api/projects/:id/tasks`) has destructured and inserted
+  `github_issue_id` since it shipped, but this tool's schema never declared
+  it — a caller's value never reached the handler, so a 200 came back with
+  the field silently stored as NULL. Fixed to persist rather than drop it.
+
+### Process
+
+- Added `.github/workflows/version-drift.yml` — reports (non-blocking) when
+  `main` has commits beyond the published version's `gitHead`, so "merged
+  but unpublished" is visible instead of being rediscovered by whoever trips
+  over it next. See README.md#releasing: **merging to `main` does not ship
+  anything** — every consumer runs whatever npm currently answers for
+  `version`, and a global `npm install -g` (several deployments run this
+  way) will not move on its own no matter what gets published.
+
 ## 2.5.0 — 2026-10-19
 
 Three **prompts**. Until now this server shipped 35 tools and nothing else, so

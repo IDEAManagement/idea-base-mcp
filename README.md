@@ -172,7 +172,37 @@ IDEA_BASE_API_KEY=your_key npm start
 
 # Watch mode
 IDEA_BASE_API_KEY=your_key npm run dev
+
+# Live integration test — spawns a real server (this checkout, or a
+# published version via --cmd) and drives it against the real API.
+# Creates and deletes its own scratch tasks; see test/live-mcp.test.mjs.
+IDEA_BASE_API_KEY=your_key node test/live-mcp.test.mjs
+IDEA_BASE_API_KEY=your_key node test/live-mcp.test.mjs --cmd "npx -y @idea-base/mcp-server@2.5.0"
 ```
+
+## Releasing
+
+**Merging to `main` does not ship anything.** Every consumer runs whatever
+`npm view @idea-base/mcp-server version` currently answers — not whatever is
+on `main`. A global `npm install -g` (several deployments run this way) is
+frozen at that version until someone explicitly re-installs it; nothing about
+publishing a new version moves it. GH #410 is seventeen days of merged work
+(`update_task(parent_task_id)`, `update_task(github_issue_id)`) that sat
+unreleased because nothing said the registry had fallen behind `main`.
+
+To actually ship a change:
+
+1. Bump `version` in `package.json`, `npm install --package-lock-only`.
+2. Commit, push, `gh release create vX.Y.Z` — `publish.yml` (Trusted
+   Publisher, Node 24, no tokens) publishes to npm on the release event.
+3. **Then check who is still on the old version.** A global install has no
+   version spec to resolve and will not move on its own — that upgrade is a
+   deliberate decision on each box, not a side effect of publishing.
+
+The `.github/workflows/version-drift.yml` workflow runs on every push to
+`main` and reports (as a non-blocking warning) when `main` has commits beyond
+the published `gitHead` — so "merged but unpublished" is visible instead of
+being rediscovered by whoever trips over it next.
 
 ## License
 

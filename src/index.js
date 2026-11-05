@@ -510,6 +510,22 @@ const tools = [
           items: { type: 'string' },
           description: 'Which named CI checks (matched case-insensitively as a substring of the check name) must pass for "ci_required"/"all" verification_mode to consider CI satisfied — e.g. ["build","test"]. Read by GET /api/tasks/:id/ci-status\'s resolveRequiredChecks (app/functions/api/tasks/[id]/ci-status.js:13-32), NOT by the GitHub webhook handler, which sets ci_status unconditionally from whichever single check/workflow event just arrived. Omit to leave unset (falls back to the project\'s own required_ci_checks, then to requiring every check). NOT wired on the REST create path — POST /api/projects/:id/tasks does not accept this field. Set it after creation with update_task instead.',
         },
+        github_issue_id: {
+          // GH #410 — this tool used to ACCEPT the field and silently drop it:
+          // the schema never declared it, so a caller's value never reached
+          // the handler's destructure and POST /api/projects/:id/tasks got no
+          // github_issue_id at all, storing NULL. A 200 plus a null anchor is
+          // worse than a rejection, because nothing told the caller it failed.
+          // Writable on the REST create path since it originally shipped
+          // (app/functions/api/projects/[id]/tasks.js) — this was purely a
+          // missing fourth layer (see the other three: D1 column, PUT, POST).
+          type: ['number', 'string'],
+          description: 'The GitHub issue number this task tracks, set at creation. LOAD-BEARING, not bookkeeping: session_heartbeats.task_id is NOT NULL and the heartbeat endpoint resolves a session\'s GitHub issue number to a task through tasks.github_issue_id — a task created for an issue without this set emits heartbeats that have nowhere to land and is invisible on the live agent board. To change or clear it on an EXISTING task, use update_task\'s github_issue_id (which also accepts null, to unlink).',
+        },
+        github_issue_url: {
+          type: 'string',
+          description: 'Full URL of the GitHub issue this task tracks, set at creation. Set it alongside github_issue_id so the two cannot disagree.',
+        },
       },
       required: ['project_id', 'title'],
     },
@@ -1240,12 +1256,18 @@ const toolHandlers = {
     };
   },
 
-  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks }) {
+  async create_task({ project_id, title, description, acceptance_criteria, estimated_minutes, priority, start_date, due_date, assignee_user_id, parent_task_id, verification_mode, github_pr_url, sort_order, is_milestone, required_ci_checks, github_issue_id, github_issue_url }) {
     // sort_order, is_milestone and required_ci_checks are forwarded for parity
     // with update_task, but POST /api/projects/:id/tasks does not destructure
     // any of the three — it always assigns MAX(sort_order)+1 and leaves
     // is_milestone/required_ci_checks at their column defaults. Sending them
     // here is a silent no-op on create; use update_task right after to set them.
+    //
+    // github_issue_id/github_issue_url are NOT silent no-ops — the REST path
+    // destructures and inserts both (GH #410) — so they are forwarded as
+    // given rather than guarded behind `!== undefined` like update_task does:
+    // there is no prior value on a brand-new task for an absent key to leave
+    // alone, so JSON.stringify simply omits an undefined field here.
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
@@ -1263,6 +1285,8 @@ const toolHandlers = {
         sort_order,
         is_milestone,
         required_ci_checks,
+        github_issue_id,
+        github_issue_url,
       }),
     });
     return {
