@@ -34,7 +34,15 @@ jobs:
           # must work for a customer on the oldest version we claim to support.
           node-version: '20'
 
-      - name: Run the test suite
+      - name: Run the offline test suite
+        # `npm test` is deliberately the GLOB `src/*.test.js` and not bare
+        # `node --test`. Default discovery would also pick up
+        # test/live-mcp.test.mjs, which by design uses no mocks: it spawns a
+        # real server against the REAL production API and creates and deletes
+        # real tasks. That is the right shape for what it checks and the wrong
+        # thing to fire on every pull request - it needs a write-scoped key and
+        # would write to production from CI. It stays behind `npm run test:live`,
+        # run deliberately by someone holding a key.
         run: npm test
 
       - name: Verify the packaged artifact contains what install needs

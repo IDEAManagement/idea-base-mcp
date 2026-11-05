@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test src/*.test.js"
+    "test": "node --test src/*.test.js",
+    "test:live": "node test/live-mcp.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "~1.29.0"

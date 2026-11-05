@@ -608,6 +608,38 @@ describe('criterion 9 - the features inventory never fabricates', () => {
     assert.equal(hb.state === STATE.NOT_FIRING, false);
   });
 
+  test('the issue-link row agrees with the actual tool schema', () => {
+    // The anti-drift pin. This row has been wrong twice in opposite directions
+    // in one day: it claimed create_task accepted github_issue_id when the
+    // field was absent, then said it was absent after 2.6.0 added it. A
+    // sentence describing a data structure in this same package must be checked
+    // against that structure, not re-read by a human each release.
+    const src = readFileSync(join(HERE, 'index.js'), 'utf8');
+    const block = (toolName) => {
+      const at = src.indexOf(`name: '${toolName}'`);
+      assert.ok(at > 0, `${toolName} not found in index.js`);
+      // Stop at the next tool declaration so the window is just this tool.
+      const next = src.indexOf("    name: '", at + 20);
+      return src.slice(at, next > 0 ? next : src.length);
+    };
+    const onCreate = block('create_task').includes('github_issue_id');
+    const onUpdate = block('update_task').includes('github_issue_id');
+
+    const local = localDone();
+    const r = buildInventory({ local, assess: assessInstall(local), remote: null })
+      .find((x) => x.key === 'issue_link');
+
+    if (onCreate && onUpdate) {
+      assert.match(r.detail, /both create_task and update_task/,
+        'both schemas carry the field, so the row must say both');
+    } else if (onUpdate && !onCreate) {
+      assert.match(r.detail, /NOT through create_task/,
+        'create_task lacks the field, so the row must say it is unavailable there');
+    } else {
+      assert.fail(`unexpected schema shape (create=${onCreate}, update=${onUpdate}) - the row's wording needs revisiting, which is the point of this test`);
+    }
+  });
+
   test('verification_mode is honest that the data does not exist', () => {
     const local = localDone();
     const rows = buildInventory({ local, assess: assessInstall(local), remote: null });

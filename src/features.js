@@ -270,21 +270,33 @@ export function buildInventory({ local, assess, remote }) {
   // "available / not available in this project" is the question the issue asks,
   // and availability genuinely changed recently, so it is reported as a
   // capability of the running server rather than as a fixed yes.
-  // MEASURED, after an earlier revision of this row overstated it. The claim
-  // "create_task and update_task both accept github_issue_id" was written from
-  // belief and is false: `github_issue_id` appears in `update_task`'s schema
-  // only. Passing it to `create_task` is silently discarded - the tool reports
-  // success and the column reads back null, which is how this very task was
-  // created before the value had to be set over REST.
+  // THIS ROW HAS BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS, INSIDE ONE DAY -
+  // which is why it is now pinned by a test rather than by care.
   //
-  // Reported as a two-step capability rather than a yes, because a customer who
-  // anchors heartbeats by issue number and creates tasks through `create_task`
-  // would otherwise get `issue_not_resolved` forever with nothing saying why.
+  // It first claimed create_task and update_task both accepted
+  // `github_issue_id`. Measured: the field was in update_task's schema ONLY,
+  // and create_task discarded it silently - a 200 with the column reading back
+  // null, which is exactly how task 990860 came to be created with no anchor
+  // and had to be fixed over REST. That correction was written, and 2.6.0 then
+  // added the field to create_task, making the correction stale within the
+  // hour.
+  //
+  // The lesson is not "be more careful with the prose". It is that a sentence
+  // asserting what a tool schema contains has no business BEING prose: it is a
+  // claim about a data structure in this same package, and it goes stale
+  // silently every time that structure moves. So the wording below is held to
+  // the real schema by a test (setup.test.js, "the issue-link row agrees with
+  // the actual tool schema"). Change which tools accept the field and the test
+  // fails, instead of a customer reading a confident falsehood.
+  //
+  // It is reported as a capability of THIS server version for the same reason:
+  // the honest answer to "is linking available" depends on what is installed,
+  // and it has changed twice.
   rows.push(row({
     key: 'issue_link',
     name: 'Task <-> GitHub issue linking (github_issue_id)',
     state: STATE.ON,
-    detail: 'available through update_task. NOT through create_task - the field is absent from its schema and is silently discarded, so a new task needs create_task followed by update_task (or a REST PUT). Load-bearing for heartbeats anchored by issue number: the endpoint resolves an issue to a task through this column, and a task without it collects pings that have nowhere to land.',
+    detail: 'available on both create_task and update_task in this server version. Load-bearing for heartbeats anchored by issue number: the endpoint resolves an issue to a task through this column, so a task created for an issue without it collects pings that have nowhere to land and is invisible on the live board.',
     lastDataNote: 'no endpoint reports linkage coverage - there is no count, no ratio, no linked_at column and no linked/unlinked filter, so "how much of this project is linked" can only be computed by listing every task',
     source: 'this server\'s tool schema',
   }));

@@ -44,12 +44,24 @@ Tracks `idea-base.us#383`.
   byte-identical to its origin in `idea-base.us`, with provenance recorded
   beside it. Without it, `setup` would register three hooks pointing at a file
   the customer does not have.
-- **A test suite — the first in this repository.** 56 assertions on
-  `node --test` (built into Node 20+; no dependency added). `npm test`.
+- **An offline test suite, and a `test` script to run it.** 57 assertions on
+  `node --test` (built into Node 20+; **no dependency added**), wired as
+  `npm test` and run by a new `.github/workflows/test.yml` on every pull
+  request. 2.6.0 added `test/live-mcp.test.mjs` shortly before this; the two
+  are complementary and deliberately separate — that one uses **no mocks** and
+  drives a real server against the **real production API**, which is the right
+  shape for what it checks and the wrong thing to fire on every PR, since it
+  needs a write-scoped key and would write to production from CI. So it stays
+  behind `npm run test:live`, and `npm test` is the glob `src/*.test.js` rather
+  than a bare `node --test` precisely so default discovery cannot pick it up.
+  Two of the new assertions are **discrimination controls** — a correct install
+  must not be reported broken, an undetermined capability must not be reported
+  off — because a checker that says "broken" about everything passes every
+  positive test and is worthless.
 
 ### Fixed
 
-- `serverInfo.version` reported `1.0.0` while the package was at `2.5.0`, so the
+- `serverInfo.version` reported `1.0.0` while the package was at `2.6.0`, so the
   version a client displayed bore no relation to the one installed. Now
   asserted against `package.json` by a test.
 
