@@ -18,6 +18,7 @@ import {
   McpError,
   ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
+import { runCli, SUBCOMMANDS, runSetup, runFeatures } from './cli.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -69,6 +70,27 @@ const API_KEY = (process.env.IDEA_BASE_API_KEY || '').trim();
 // AGENT_IDENTITY_NOT_RESOLVABLE / AGENT_IDENTITY_NOT_PERMITTED — deliberately loud,
 // never a silent fallback to the key owner.
 const AGENT_ID = (process.env.IDEA_BASE_AGENT_ID || 'claude_ai').trim();
+
+// ---------------------------------------------------------------------------
+// CLI MODE (#383) — and why it is branched HERE, above the API-key check
+// ---------------------------------------------------------------------------
+// `install` is entirely local: it copies a script and merges a JSON file. It
+// must therefore work for someone who has not got a key yet, which is exactly
+// the person installing for the first time. Branching below the `!API_KEY`
+// exit would make the install command unusable in the one situation it exists
+// for, and would report a missing credential as the reason setup failed.
+//
+// `features` is deliberately in the same position: with no key it degrades
+// every network-dependent row to `unknown` and still reports the whole local
+// half (are the hooks registered, is the script present, is the actor set).
+// "I could not ask" and "it is switched off" are different facts.
+//
+// stdio mode is unaffected: Claude Code launches this with no arguments, so
+// `process.argv[2]` is undefined and nothing below changes.
+if (SUBCOMMANDS.has(process.argv[2])) {
+  const { code } = await runCli(process.argv.slice(2));
+  process.exit(code ?? 0);
+}
 
 if (!API_KEY) {
   console.error('Error: IDEA_BASE_API_KEY environment variable is required');
@@ -1899,7 +1921,10 @@ const toolHandlers = {
 const server = new Server(
   {
     name: 'idea-base',
-    version: '1.0.0',
+    // Kept in step with package.json by a test; it had drifted to 1.0.0 while
+    // the package was at 2.5.0, so the version a client reported bore no
+    // relation to the one installed.
+    version: '2.7.0',
   },
   {
     capabilities: {
@@ -1918,6 +1943,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
+// ---------------------------------------------------------------------------
+// THE FIRST-USE NUDGE (#383)
+// ---------------------------------------------------------------------------
+// There is no sanctioned "run on install" moment. The MCP lifecycle forbids a
+// server sending anything but pings and logging before `initialized`, there is
+// no `MCPServerConnected` hook, and the `Setup` hook event is not it either:
+// measured against the hook reference, it fires ONLY under `--init-only` or
+// `-p --init`/`--maintenance`, cannot block, and has its output discarded on
+// every exit code. So the first authenticated tool call is the only moment we
+// are guaranteed to be running with a user present.
+//
+// Two restraints make this a pointer rather than an advertisement:
+//
+//   1. ONCE PER PROCESS. A nudge on every call is nagging, and nagging gets
+//      tools uninstalled.
+//   2. ONLY WHEN IT IS ACTUALLY MISSING. The issue asks for a pointer on the
+//      first call; appending it unconditionally would tell a correctly
+//      configured user to go configure something, which is the same "a list
+//      that always says yes" defect the features command exists to avoid. So
+//      the local install state is read first, and a complete install says
+//      nothing at all.
+//
+// It never fails a tool call: the whole thing is inside a try/catch that
+// returns the untouched result, because a broken suffix must not break a write.
+let nudgeSpent = false;
+
+async function firstUseNudge() {
+  if (nudgeSpent) return '';
+  nudgeSpent = true;
+  try {
+    const [{ resolveProjectDir, inspectLocal, assessInstall }, fsMod] = await Promise.all([
+      import('./setup.js'),
+      import('node:fs'),
+    ]);
+    const { dir } = resolveProjectDir(process.env);
+    const assess = assessInstall(inspectLocal({ projectDir: dir, env: process.env, fs: fsMod }));
+    if (assess.verdict === 'complete') return '';
+    const why = assess.reasons[0] ? ` (${assess.reasons[0]})` : '';
+    return `\n\nThis project is not emitting IDEA Base session activity${why}. Run /idea-base:setup to see what is missing — it changes nothing on its own.`;
+  } catch {
+    return '';
+  }
+}
+
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -1930,7 +1999,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const safeArgs = validateArgs(name, tool.inputSchema, args);
-    return await handler(safeArgs);
+    const result = await handler(safeArgs);
+    try {
+      const nudge = await firstUseNudge();
+      if (nudge && !result?.isError && Array.isArray(result?.content)) {
+        const last = result.content[result.content.length - 1];
+        if (last?.type === 'text' && typeof last.text === 'string') last.text += nudge;
+      }
+    } catch { /* a nudge must never cost a tool call */ }
+    return result;
   } catch (error) {
     return {
       content: [
@@ -2067,6 +2144,25 @@ const prompts = [
     arguments: [
       { name: 'product_id', description: 'Product id (find ids with list_products).', required: true },
     ],
+  },
+  // --- #383 -----------------------------------------------------------------
+  // `arguments: []` is REQUIRED, not merely tidy. The GetPrompt handler below
+  // iterates `spec.arguments` unconditionally and coerces every declared
+  // argument with `Number(...)`, refusing anything that is not a positive
+  // integer id. An omitted key would throw on the iteration, and a non-numeric
+  // argument would be rejected by a validator written for ids. Neither of these
+  // two prompts takes an argument, so declaring none sidesteps both.
+  {
+    name: 'setup',
+    description:
+      'Check whether this project emits IDEA Base session tracking, and say plainly whether your sessions are being tracked. Reports every missing piece with the literal text to add, states what it could not check rather than passing over it, and writes nothing. Safe to run as often as you like - re-running it IS the audit.',
+    arguments: [],
+  },
+  {
+    name: 'features',
+    description:
+      'Inventory of IDEA Base capabilities as they are actually wired on THIS machine, not as the product advertises them: each one on, off, configured-but-not-firing, or undetermined - and for the undetermined ones, why nothing here can tell.',
+    arguments: [],
   },
 ];
 
@@ -2233,10 +2329,61 @@ async function buildPlanSprint(args) {
   ].join('\n'));
 }
 
+// ---------------------------------------------------------------------------
+// #383: the setup and features prompt bodies
+// ---------------------------------------------------------------------------
+// Computed here, at request time, against real local state - the same idiom the
+// sprint prompts already use against the live API, and the reason these are
+// prompts rather than static text. The alternative considered and rejected was
+// returning an instruction set for the model to carry out: a report the model
+// assembles cannot be unit-tested, and criteria 3, 4, 5 and 10 are all claims
+// about exactly what the inspection and the write DO.
+//
+// MEASURED (2026-11-05), because the whole approach depends on it: a server
+// process launched by a session in a git worktree sees CLAUDE_PROJECT_DIR and
+// process.cwd() both set to that worktree, while PWD points at a DIFFERENT
+// checkout three directories up. So the project directory is resolvable here,
+// and `PWD` must never be used for it.
+//
+// Note what the prompt does NOT do: it never writes. The MCP spec has no
+// primitive for writing a customer's settings file, so recommending is the only
+// in-spec option, and the `install` subcommand is the consenting user's own act.
+async function renderToText(run) {
+  const lines = [];
+  await run({ log: (s) => lines.push(String(s)) });
+  return lines.join('\n');
+}
+
+async function buildSetupPrompt() {
+  const report = await renderToText((o) => runSetup(o));
+  return textMessage([
+    report,
+    '',
+    '---',
+    'The block above is a report this server computed from the project on disk.',
+    'It has changed nothing. If it recommends changes, show them to the user and',
+    'ask before applying anything - then run the install command it names.',
+  ].join('\n'));
+}
+
+async function buildFeaturesPrompt() {
+  const report = await renderToText((o) => runFeatures(o));
+  return textMessage([
+    report,
+    '',
+    '---',
+    'Read-only inventory; nothing was changed. Where a row says UNKNOWN it means',
+    'nothing available here could determine it, and the reason is given - do not',
+    'present an undetermined row as either working or broken.',
+  ].join('\n'));
+}
+
 const promptBuilders = {
   start_sprint: buildStartSprint,
   sprint_report: buildSprintReport,
   plan_sprint: buildPlanSprint,
+  setup: buildSetupPrompt,
+  features: buildFeaturesPrompt,
 };
 
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {

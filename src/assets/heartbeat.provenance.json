@@ -1,0 +1,10 @@
+{
+  "file": "heartbeat.sh",
+  "sha256": "18fbd977aa37f9261891932cf1f09155790c6097c17c4e27caeb205df0b8afb4",
+  "origin_repo": "IDEAManagement/idea-base.us",
+  "origin_path": ".claude/hooks/heartbeat.sh",
+  "origin_commit": "44e182d90f6dfc55d009e1186e2dec4f19015bc0",
+  "contract": "docs/session-tracking-install.md",
+  "vendored_at": "2026-11-05",
+  "why_byte_identical": "This file is a VERBATIM copy of the origin path at the origin commit, deliberately unmodified - no header was added, because adding one would change the bytes and make a drift check against upstream impossible. Provenance lives here instead. Re-vendor with: cp <idea-base.us>/.claude/hooks/heartbeat.sh src/assets/heartbeat.sh && update sha256 + origin_commit above. src/setup.test.js asserts the sha256 recorded here, which catches a local edit; byte-identity with upstream is a cross-repo check neither repo's CI can perform today."
+}

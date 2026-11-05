@@ -1,0 +1,421 @@
+// cli.js - `install`, `doctor` and `features` subcommands. Issue #383.
+//
+// =============================================================================
+// WHY THERE IS A CLI AT ALL, AND NOT JUST A PROMPT
+// =============================================================================
+// The MCP spec has no primitive for writing a customer's settings file -
+// resources are list/read/subscribe only - so the prompt's job is to RECOMMEND.
+// But three of this issue's acceptance criteria are claims about the WRITE:
+// that declining leaves the config byte-identical, that pre-existing unrelated
+// hooks survive it, and that a second run changes nothing. If the writer were a
+// model improvising an edit, not one of those would be checkable.
+//
+// So the write is a deterministic subcommand over a pure merge function, and
+// consent is the user running it. The prompt never writes; this does, and only
+// with --apply.
+//
+// =============================================================================
+// WHY `doctor` IS NOT OPTIONAL
+// =============================================================================
+// A customer must be able to tell a working install from a broken one, and
+// "three hooks are registered" does not establish that. Absence is silent at
+// several points in the heartbeat path: the endpoint answers HTTP 202 with
+// `{"recorded":false}` when it discards a ping, a nonexistent agent id is
+// refused with no row written at all, and a read-only key is rejected before
+// the handler runs. Every one of those looks like success from the outside.
+//
+// This posts ONE labelled probe and reports the server's own `recorded` verdict.
+
+// Only `realFs` is imported, deliberately. An earlier revision also pulled in
+// the individual functions and used them directly in runInstall, which made the
+// injected `fs` decorative: every write went to the real disk regardless, and
+// the tests that prove "a dry run writes nothing" and "the script is written
+// before the settings" were asserting against a filesystem they did not
+// control. The test suite caught it by trying to mkdir /fake/project.
+import * as realFs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+
+import {
+  resolveProjectDir,
+  inspectLocal,
+  assessInstall,
+  planMerge,
+  readSettings,
+  HOOK_SCRIPT_REL,
+} from './setup.js';
+import { buildInventory, probeRemote } from './features.js';
+import { renderSetupReport, renderFeaturesReport, renderInstallPlan } from './render.js';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+export const SUBCOMMANDS = new Set(['install', 'doctor', 'features', 'setup']);
+
+function parseFlags(argv) {
+  const flags = { apply: false, actor: null, json: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--apply') flags.apply = true;
+    else if (a === '--json') flags.json = true;
+    else if (a === '--actor') { flags.actor = (argv[i + 1] || '').trim() || null; i += 1; }
+    else if (a.startsWith('--actor=')) flags.actor = a.slice(8).trim() || null;
+  }
+  return flags;
+}
+
+function apiBase(env) {
+  const custom = (env.IDEA_BASE_API_URL || '').trim();
+  return custom || 'https://app.idea-base.us/api';
+}
+
+/**
+ * The hook and the MCP server read DIFFERENT environment variables for the same
+ * credential, and the underscore placement differs between them
+ * (IDEA_BASE_API_KEY vs IDEABASE_HEARTBEAT_KEY). A customer who sets one and
+ * assumes the other inherits gets silence. Accepting either here is what keeps
+ * a naming trap from reading as a broken install.
+ */
+function resolveKey(env) {
+  const hook = (env.IDEABASE_HEARTBEAT_KEY || '').trim();
+  if (hook) return { key: hook, source: 'IDEABASE_HEARTBEAT_KEY' };
+  const mcp = (env.IDEA_BASE_API_KEY || '').trim();
+  if (mcp) return { key: mcp, source: 'IDEA_BASE_API_KEY' };
+  return { key: null, source: null };
+}
+
+function makeApiGet(env) {
+  const { key } = resolveKey(env);
+  if (!key) return null;
+  const base = apiBase(env);
+  return async (path) => {
+    const res = await fetch(`${base}${path}`, {
+      method: 'GET',
+      redirect: 'error',
+      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${text.slice(0, 200)}`);
+    try { return JSON.parse(text); } catch { throw new Error('response was not JSON'); }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// doctor
+// ---------------------------------------------------------------------------
+/**
+ * Exit status is the contract `/idea-base:setup` gates on:
+ *   0  the row was recorded (or heartbeats are deliberately switched off)
+ *   1  the endpoint refused or skipped it
+ *   2  could not get as far as asking
+ *
+ * `2` is a genuinely different answer from `1` and conflating them is the whole
+ * problem: "I asked and was told no" and "I never managed to ask" need
+ * different fixes, and a single boolean hides which one you have.
+ */
+export async function runDoctor({ env = process.env, fs = realFs, log = console.log, exec = execFileSync } = {}) {
+  const { dir: projectDir } = resolveProjectDir(env);
+  const local = inspectLocal({ projectDir, env, fs });
+
+  if (local.env.heartbeatOff) {
+    log('=== verdict: DISABLED ===');
+    log('  IDEABASE_HEARTBEAT is set to off. Nothing is emitted, deliberately.');
+    return { code: 0, verdict: 'DISABLED', detail: ['heartbeats are switched off by IDEABASE_HEARTBEAT'] };
+  }
+
+  const scriptPath = join(projectDir, HOOK_SCRIPT_REL);
+  if (!local.script.present) {
+    log('=== verdict: NOT INSTALLED ===');
+    log(`  ${HOOK_SCRIPT_REL} is absent, so there is no hook to ask.`);
+    log('  Fix:  npx @idea-base/mcp-server install --apply --actor <agent-user-id>');
+    return {
+      code: 2,
+      verdict: 'NOT INSTALLED - no heartbeat script in this project, so nothing could be asked',
+      detail: [`${HOOK_SCRIPT_REL} is absent`, 'fix: npx @idea-base/mcp-server install --apply'],
+    };
+  }
+
+  // Ask the REAL hook what it would send. A diagnostic that re-derives the
+  // anchor itself would resolve differently from the hook and so would pass
+  // while the hook failed - which is the exact failure this is meant to expose.
+  //
+  // THE TWO DIRECTORIES ARE NOT THE SAME DIRECTORY, and conflating them makes
+  // this command lie in the worst direction. The hook keeps:
+  //
+  //   the throttle stamp  at ${TMPDIR}/ib-heartbeat/<cksum>.stamp
+  //   the resolved anchor at ${IDEABASE_HEARTBEAT_STATE_DIR:-${TMPDIR}/ib-heartbeat}/<cksum>.anchor
+  //
+  // TMPDIR must be private, because the 60-second throttle stamp is keyed on
+  // the project directory and invoking the hook from inside a live session
+  // would otherwise throttle that session's own heartbeats away for a minute.
+  // But the ANCHOR has to be read from the real location, or `resolve` finds no
+  // state file and reports "nothing resolved" for a session that is in fact
+  // perfectly tracked.
+  //
+  // Measured: with only TMPDIR redirected, this command reported NOT TRACKED
+  // for a session whose own anchor was task 990860 - a FALSE NEGATIVE, telling
+  // a correctly-configured customer their tracking was broken. The state-dir
+  // override exists precisely so the two can be separated.
+  let resolved = {};
+  try {
+    const scratch = mkdtempSync(join(tmpdir(), 'ib-doctor-'));
+    const realStateDir = join((env.TMPDIR || '/tmp'), 'ib-heartbeat');
+    const out = exec('sh', [scriptPath, 'resolve'], {
+      cwd: projectDir,
+      env: {
+        ...env,
+        TMPDIR: scratch,
+        IDEABASE_HEARTBEAT_STATE_DIR: env.IDEABASE_HEARTBEAT_STATE_DIR || realStateDir,
+        CLAUDE_PROJECT_DIR: projectDir,
+      },
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    for (const line of out.split('\n')) {
+      const i = line.indexOf('=');
+      if (i > 0) resolved[line.slice(0, i)] = line.slice(i + 1);
+    }
+  } catch (err) {
+    log('=== verdict: COULD NOT ASK THE HOOK ===');
+    log(`  ${err?.message || 'resolve failed'}`);
+    return { code: 2, verdict: 'COULD NOT ASK THE HOOK', detail: [String(err?.message || err)] };
+  }
+
+  const taskId = (resolved.TASK_ID || '').trim();
+  const issueId = (resolved.ISSUE || '').trim();
+  const { key, source: keySource } = resolveKey(env);
+
+  log('=== resolution (what the hook would send from here) ===');
+  log(`  project dir : ${projectDir}`);
+  log(`  task_id     : ${taskId || '(none)'}`);
+  log(`  issue_id    : ${issueId || '(none)'}`);
+  log(`  resolved by : ${resolved.ANCHOR_SOURCE || '(unrecorded)'}`);
+  log(`  key         : ${key ? `present via ${keySource}` : 'ABSENT'}`);
+  log(`  actor       : ${resolved.ACTOR || '(unset)'}`);
+  log('');
+
+  if (!taskId && !issueId) {
+    log('=== verdict: NOT TRACKED - no anchor ===');
+    log('  This session has not declared what it is working on, so there is');
+    log('  nothing truthful to send and nothing is sent. That is correct for a');
+    log('  session that is not working a task.');
+    log('  Fix: call start_working(task_id), or set IDEABASE_TASK_ID.');
+    return {
+      code: 2,
+      verdict: 'NOT TRACKED - this session declared no task, so nothing is sent (correct for an ad-hoc session)',
+      detail: ['fix: call start_working(task_id) or set IDEABASE_TASK_ID'],
+    };
+  }
+  if (!key) {
+    log('=== verdict: NO KEY ===');
+    log('  Neither IDEABASE_HEARTBEAT_KEY nor IDEA_BASE_API_KEY is set here, so');
+    log('  the probe cannot be sent. Note the key must have WRITE scope.');
+    return { code: 2, verdict: 'NO KEY - nothing could be sent', detail: ['set IDEABASE_HEARTBEAT_KEY (write scope)'] };
+  }
+
+  // The probe's session id is deliberately NOT a real harness session id, so a
+  // row this writes can never be mistaken for evidence that the emitter itself
+  // works. A board populated by diagnostics is not a live board.
+  const body = { event: 'tool', session_id: `doctor-${process.pid}`, spoke: 'mcp-doctor' };
+  if (taskId) body.task_id = Number(taskId);
+  else body.issue_id = issueId;
+
+  const url = `${apiBase(env).replace(/\/api$/, '/api')}/heartbeat`;
+  let status = 0;
+  let text = '';
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      redirect: 'error',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        ...(resolved.ACTOR && !resolved.ACTOR.startsWith('<') ? { 'X-On-Behalf-Of': resolved.ACTOR } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    status = res.status;
+    text = await res.text();
+  } catch (err) {
+    log('=== verdict: NO RESPONSE ===');
+    log(`  ${err?.message || 'request failed'}`);
+    return { code: 1, verdict: 'NO RESPONSE from the endpoint', detail: [String(err?.message || err)] };
+  }
+
+  log('=== response ===');
+  log(`  HTTP ${status}`);
+  log(`  ${text.slice(0, 400)}`);
+  log('');
+
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch { /* reported below */ }
+
+  // HTTP 202 WITH `recorded:false` IS THE TRAP. A plausible status, a refusal
+  // buried in the body, and a client that never read it is why no stop
+  // heartbeat had ever been recorded before idea-base.us#409. The status code
+  // is not the verdict; the `recorded` field is.
+  if (parsed?.recorded === true) {
+    const agent = parsed.actor_is_agent === true;
+    log('=== verdict: RECORDED ===');
+    log(`  attributed to : ${parsed.actor_id || '(unknown)'} (is_agent=${parsed.actor_is_agent})`);
+    if (!agent) {
+      log('  WARNING: attributed to a non-agent identity. The agent board filters');
+      log('  to agents, so sessions like this are filtered off it entirely.');
+      log('  Fix: set env.IDEABASE_ACTOR in .claude/settings.json.');
+    }
+    return {
+      code: 0,
+      verdict: agent ? 'RECORDED - your sessions are being tracked' : 'RECORDED, BUT MIS-ATTRIBUTED - the row landed as a non-agent and will be filtered off the agent board',
+      detail: [
+        `row id ${parsed.id ?? '?'} on task ${parsed.task_id ?? '?'}`,
+        `attributed to ${parsed.actor_id || '(unknown)'} (is_agent=${parsed.actor_is_agent})`,
+        ...(agent ? [] : ['fix: set env.IDEABASE_ACTOR in .claude/settings.json']),
+      ],
+    };
+  }
+
+  const reason = parsed?.reason || parsed?.code || parsed?.error || `HTTP ${status}`;
+  log(`=== verdict: NOT RECORDED - reason: ${reason} ===`);
+  if (status === 202) {
+    log('  Note the status: 202 is a SUCCESS code for "I threw this away". The');
+    log('  status line is not the verdict - the `recorded` field is.');
+  }
+  if (reason === 'issue_not_resolved') {
+    log('  No task in your workspace carries that GitHub issue number in');
+    log('  github_issue_id, so the ping had nowhere to land.');
+  }
+  if (status === 403) {
+    log('  403 here is one of: a read-only API key on a POST, or a declared');
+    log('  actor that does not exist or is a human. All three write NO ROW.');
+  }
+  return {
+    code: 1,
+    verdict: `NOT RECORDED - the server refused it (${reason})`,
+    detail: [`HTTP ${status}`, `reason: ${reason}`],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// install
+// ---------------------------------------------------------------------------
+/**
+ * Writes the script BEFORE registering anything that points at it.
+ *
+ * The order is load-bearing, not tidy. A hook whose script is missing fails
+ * CLOSED - it can deny Bash and Edit, including the edit needed to repair the
+ * hook - and subagents inherit session hooks, so delegating does not help
+ * either. Registering first and copying second would leave a window in which
+ * the project is bricked, and if the copy then failed it would stay that way.
+ */
+export async function runInstall({ env = process.env, fs = realFs, log = console.log, argv = [] } = {}) {
+  const flags = parseFlags(argv);
+  const { dir: projectDir } = resolveProjectDir(env);
+  const local = inspectLocal({ projectDir, env, fs });
+  const actor = flags.actor || local.actorEffective || null;
+  const plan = planMerge(local.settings ?? {}, { actor });
+
+  if (!flags.apply) {
+    log(renderInstallPlan({ local, plan, actor }));
+    return { code: local.parseError ? 1 : 0, applied: false, plan };
+  }
+
+  if (local.parseError) {
+    log(`REFUSING: ${local.settingsPath} - ${local.parseError}`);
+    log('A file I cannot parse is not an empty file; rewriting it would delete');
+    log('every hook you have. Fix the JSON and run this again.');
+    return { code: 1, applied: false, plan };
+  }
+
+  const assetPath = join(HERE, 'assets', 'heartbeat.sh');
+  const destPath = join(projectDir, HOOK_SCRIPT_REL);
+  let wroteScript = false;
+  if (!local.script.present) {
+    if (!fs.existsSync(assetPath)) {
+      // This is the `files` footgun made loud. package.json's `files` list
+      // decides what npm actually publishes, so a vendored asset left out of it
+      // is silently absent for every customer while working perfectly from a
+      // git checkout.
+      log(`REFUSING: the packaged hook script is missing at ${assetPath}.`);
+      log('This build of the package cannot install session tracking. Registering');
+      log('the hooks without it would point three hooks at a missing file, which');
+      log('fails CLOSED and can deny Bash and Edit in your session.');
+      return { code: 1, applied: false, plan };
+    }
+    fs.mkdirSync(dirname(destPath), { recursive: true });
+    fs.writeFileSync(destPath, fs.readFileSync(assetPath, 'utf8'), 'utf8');
+    try { fs.chmodSync(destPath, 0o755); } catch { /* best effort; the hook is invoked via `sh` */ }
+    wroteScript = true;
+    log(`wrote ${HOOK_SCRIPT_REL}`);
+  }
+
+  if (plan.idempotent) {
+    log(wroteScript
+      ? 'Script installed. The hook registrations were already correct, so settings.json is unchanged.'
+      : 'Nothing to do - already installed correctly. settings.json left byte-identical.');
+    return { code: 0, applied: wroteScript, plan };
+  }
+
+  fs.mkdirSync(dirname(local.settingsPath), { recursive: true });
+  fs.writeFileSync(local.settingsPath, `${JSON.stringify(plan.next, null, 2)}\n`, 'utf8');
+  for (const c of plan.changes) log(`  * ${c.detail}`);
+  log('');
+  log(`updated ${local.settingsPath}`);
+  if (!actor) {
+    log('');
+    log('env.IDEABASE_ACTOR was NOT set, because no --actor was given and one is');
+    log('never defaulted: a wrong agent id is refused by the server and writes no');
+    log('row at all, which is worse than a visibly mislabelled one.');
+  }
+  log('');
+  log('Verify it:  npx @idea-base/mcp-server doctor');
+  return { code: 0, applied: true, plan };
+}
+
+// ---------------------------------------------------------------------------
+// features / setup (CLI forms of the two prompts)
+// ---------------------------------------------------------------------------
+export async function runFeatures({ env = process.env, fs = realFs, log = console.log } = {}) {
+  const { dir: projectDir } = resolveProjectDir(env);
+  const local = inspectLocal({ projectDir, env, fs });
+  const assess = assessInstall(local);
+  const apiGet = makeApiGet(env);
+  const remote = apiGet ? await probeRemote(apiGet) : null;
+  const rows = buildInventory({ local, assess, remote });
+  log(renderFeaturesReport({ local, rows, remote }));
+  return { code: 0, rows };
+}
+
+export async function runSetup({ env = process.env, fs = realFs, log = console.log } = {}) {
+  const { dir: projectDir } = resolveProjectDir(env);
+  const local = inspectLocal({ projectDir, env, fs });
+  const assess = assessInstall(local);
+  const plan = local.parseError ? null : planMerge(local.settings ?? {}, { actor: local.actorEffective });
+  let doctor = null;
+  let probeSkippedReason = null;
+  if (local.script.present) {
+    const lines = [];
+    const r = await runDoctor({ env, fs, log: (s) => lines.push(s) });
+    doctor = { verdict: r.verdict, detail: r.detail };
+  } else {
+    probeSkippedReason = 'the heartbeat script is not installed here, so there is no hook to ask';
+  }
+  log(renderSetupReport({ local, assess, plan, doctor, probeSkippedReason }));
+  return { code: 0, assess };
+}
+
+export async function runCli(argv, { env = process.env, fs = realFs, log = console.log } = {}) {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case 'install': return runInstall({ env, fs, log, argv: rest });
+    case 'doctor': return runDoctor({ env, fs, log });
+    case 'features': return runFeatures({ env, fs, log });
+    case 'setup': return runSetup({ env, fs, log });
+    default:
+      log(`Unknown subcommand: ${sub}`);
+      return { code: 2 };
+  }
+}
+
+export { readSettings };
