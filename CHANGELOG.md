@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.7.1 — 2026-11-06
+
+**`doctor` and the heartbeat hook now agree about the API key.** Tracks
+`idea-base.us#440` / `idea-base-mcp#29`.
+
+### Fixed
+
+- `doctor`'s PRESENT/ABSENT verdict is now read off the hook's own `resolve`
+  output instead of an independently-derived guess, so the two can no longer
+  disagree. Previously a machine with only `IDEA_BASE_API_KEY` set could get
+  `doctor` reporting the row RECORDED while the real hook (which did not yet
+  accept that variable) sent nothing.
+- `resolveKey` now also tries the secrets-store fallback
+  (`~/.claude/core/secrets/get idea-base-api-key`), matching the hook's own
+  precedence — a machine where only that fallback resolved used to report
+  ABSENT.
+- A session with no declared anchor no longer sees a `key:` line printed
+  ahead of the `NOT TRACKED` verdict.
+- The vendored `heartbeat.sh` is re-synced with upstream idea-base.us, which
+  itself now accepts `IDEA_BASE_API_KEY` as a second-priority credential tier.
+
 ## 2.7.0 — 2026-11-05
 
 **The product now instructs you to use it.** Installing IDEA Base gave you

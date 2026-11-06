@@ -426,11 +426,27 @@ fi
 # The credential. Env var first so tests and CI can drive this without the
 # secret store; then the store.
 #
+# `IDEA_BASE_API_KEY` is the MCP server's own name for this same credential
+# (see idea-base-mcp/src/cli.js's `resolveKey` comment: "the hook and the MCP
+# server read DIFFERENT environment variables for the same credential... a
+# customer who sets one and assumes the other inherits gets silence"). That
+# comment documented the synonym as already-intended; this hook just never
+# implemented its half. idea-base.us#440 / idea-base-mcp#29: a customer with
+# only IDEA_BASE_API_KEY set got `doctor` reporting the row RECORDED while
+# this hook silently sent nothing — the worse of the two possible directions,
+# because it is the hook's actual behaviour that is wrong, not just a
+# diagnostic's guess about it.
+#
 # `secrets/get` lives under ~/.claude/core, which may be absent — hence the
 # -x test before calling it, the same absence-is-silent rule as everything
 # else here. It exits non-zero on a missing secret and prints the fix, so the
-# `|| true` keeps a missing key from tripping anything.
+# `|| true` keeps a missing key from tripping anything. It is ours, not the
+# customer's: a customer machine has no ~/.claude/core, so -x is always false
+# there and this tier is a silent no-op, never a dependency.
 HB_KEY="${IDEABASE_HEARTBEAT_KEY:-}"
+if [ -z "$HB_KEY" ]; then
+  HB_KEY="${IDEA_BASE_API_KEY:-}"
+fi
 if [ -z "$HB_KEY" ]; then
   GETTER="$HOME/.claude/core/secrets/get"
   if [ -x "$GETTER" ]; then
@@ -442,7 +458,7 @@ fi
 # the handler runs, so sending a placeholder is strictly worse than sending
 # nothing: it burns a request and writes no row either way.
 if [ -z "$HB_KEY" ] && [ "$EVENT" != "resolve" ]; then
-  hb_trace "result=NOT_SENT reason=no_api_key session=$SESSION_ID tried=IDEABASE_HEARTBEAT_KEY,secrets/get(idea-base-api-key)"
+  hb_trace "result=NOT_SENT reason=no_api_key session=$SESSION_ID tried=IDEABASE_HEARTBEAT_KEY,IDEA_BASE_API_KEY,secrets/get(idea-base-api-key)"
   exit 0
 fi
 
