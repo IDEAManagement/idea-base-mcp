@@ -734,6 +734,114 @@ describe('the doctor reads the anchor from the REAL state dir (regression)', () 
   });
 });
 
+/**
+ * Stubs global fetch for the duration of `fn`, always restoring it
+ * afterwards. Everything else in this file reaches a verdict before doctor
+ * would ever call fetch - these two tests are the first to need the key
+ * check to pass, and a real network call in a unit test is both slow and a
+ * dependency this suite's own header says it does not want.
+ */
+async function withFetch(response, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => response;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+// ===========================================================================
+describe('doctor and the hook must share one API key path (idea-base.us#440 / idea-base-mcp#29)', () => {
+  // criterion 1: on a machine with only IDEA_BASE_API_KEY set, doctor's
+  // verdict must match what the hook actually does.
+  //
+  // Before this fix, runDoctor decided PRESENT/ABSENT from its OWN
+  // resolveKey(env) call, which already accepted IDEA_BASE_API_KEY as a
+  // fallback - so this test's env, on its own, would have made the old code
+  // proceed to send. It only diverges from the hook once the HOOK's own
+  // resolve output disagrees, which is exactly the real-world shape of the
+  // bug (reported from the 2.7.0 source, idea-base-mcp#29): a hook that does
+  // not yet accept IDEA_BASE_API_KEY reports API_KEY=ABSENT, while the old
+  // doctor code, deriving independently, found a key anyway and reported
+  // RECORDED for a probe the real hook would never have sent. Mocking
+  // `exec` to return ABSENT here is standing in for that unfixed hook.
+  test('criterion 1 - the verdict matches resolve\'s API_KEY field, not an independent guess', async () => {
+    const fs = fakeFs({ [SCRIPT]: '#!/bin/sh\n' });
+    const r = await runDoctor({
+      env: { CLAUDE_PROJECT_DIR: PROJECT, IDEA_BASE_API_KEY: 'only-this-one-set' },
+      fs,
+      log: () => {},
+      exec: () => 'TASK_ID=1\nISSUE=\nANCHOR_SOURCE=test\nAPI_KEY=ABSENT\n',
+    });
+    assert.equal(r.code, 2);
+    assert.match(r.verdict, /NO KEY/, 'must agree with the hook, not override it with its own guess');
+  });
+
+  // DISCRIMINATION CONTROL for criterion 1: when the hook's own resolve DOES
+  // report present (e.g. because heartbeat.sh itself now accepts
+  // IDEA_BASE_API_KEY, or resolves it via the secrets store), doctor must
+  // not report NO KEY just because its OWN resolveKey happened to look in a
+  // different place. A checker that says ABSENT about everything would pass
+  // the test above for the wrong reason.
+  test('DISCRIMINATION CONTROL: resolve reporting present is honoured, not second-guessed', async () => {
+    const fs = fakeFs({ [SCRIPT]: '#!/bin/sh\n' });
+    const r = await withFetch(
+      { status: 403, text: async () => '{"reason":"forbidden"}' },
+      () => runDoctor({
+        env: { CLAUDE_PROJECT_DIR: PROJECT, IDEA_BASE_API_KEY: 'only-this-one-set' },
+        fs,
+        log: () => {},
+        exec: () => 'TASK_ID=1\nISSUE=\nANCHOR_SOURCE=test\nAPI_KEY=present\n',
+      }),
+    );
+    assert.notEqual(r.verdict, 'NO KEY - nothing could be sent');
+  });
+
+  // criterion 2: on a machine where only the secrets fallback resolves,
+  // doctor must no longer report ABSENT. Before this fix resolveKey() never
+  // called the secrets getter at all, so a machine with NEITHER env var set
+  // reported NO KEY even when the getter would have supplied one.
+  test('criterion 2 - the secrets-store fallback is consulted, not skipped', async () => {
+    const fs = fakeFs({ [SCRIPT]: '#!/bin/sh\n' });
+    let getterCalled = false;
+    const r = await withFetch(
+      { status: 403, text: async () => '{"reason":"forbidden"}' },
+      () => runDoctor({
+        env: { CLAUDE_PROJECT_DIR: PROJECT }, // neither key env var set
+        fs,
+        log: () => {},
+        exec: (cmd, args) => {
+          if (cmd === 'sh') return 'TASK_ID=1\nISSUE=\nANCHOR_SOURCE=test\nAPI_KEY=present\n';
+          // the secrets getter: any other command is this tier.
+          getterCalled = true;
+          assert.deepEqual(args, ['idea-base-api-key']);
+          return 'a-secret-value-from-the-store\n';
+        },
+      }),
+    );
+    assert.ok(getterCalled, 'the secrets fallback must actually be tried');
+    assert.notEqual(r.verdict, 'NO KEY - nothing could be sent');
+  });
+
+  // criterion 3: a no-anchor session must not see a key line ahead of its
+  // real verdict. Before this fix the key/actor block was logged
+  // unconditionally, above the anchor check.
+  test('criterion 3 - no anchor means no key line is ever printed', async () => {
+    const fs = fakeFs({ [SCRIPT]: '#!/bin/sh\n' });
+    const lines = [];
+    const r = await runDoctor({
+      env: { CLAUDE_PROJECT_DIR: PROJECT, IDEABASE_HEARTBEAT_KEY: 'k' },
+      fs,
+      log: (s) => lines.push(s),
+      exec: () => 'TASK_ID=\nISSUE=\nANCHOR_SOURCE=NOTHING RESOLVED\n',
+    });
+    assert.equal(r.code, 2);
+    assert.match(r.verdict, /NOT TRACKED/);
+    assert.ok(!lines.some((l) => /key/i.test(l)), `a key line leaked ahead of the verdict: ${JSON.stringify(lines)}`);
+  });
+});
+
 // ===========================================================================
 describe('the packaged hook script', () => {
   test('matches the sha256 recorded in its provenance manifest', () => {

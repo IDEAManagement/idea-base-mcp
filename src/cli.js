@@ -72,17 +72,32 @@ function apiBase(env) {
 }
 
 /**
- * The hook and the MCP server read DIFFERENT environment variables for the same
- * credential, and the underscore placement differs between them
- * (IDEA_BASE_API_KEY vs IDEABASE_HEARTBEAT_KEY). A customer who sets one and
- * assumes the other inherits gets silence. Accepting either here is what keeps
- * a naming trap from reading as a broken install.
+ * THREE tiers, in the SAME order heartbeat.sh resolves them (idea-base.us
+ * .claude/hooks/heartbeat.sh, the vendored copy at src/assets/heartbeat.sh):
+ * IDEABASE_HEARTBEAT_KEY, then IDEA_BASE_API_KEY (the MCP server's own name
+ * for this same credential - a customer who sets one and assumes the other
+ * inherits gets silence otherwise), then our own secrets store. Before
+ * idea-base.us#440 / idea-base-mcp#29 this stopped at the second tier, so a
+ * machine where only the secrets fallback resolved made `doctor` report
+ * ABSENT for a hook that was in fact sending successfully.
+ *
+ * `doctor` does NOT use this function's return to decide the PRESENT/ABSENT
+ * verdict - see runDoctor, which reads that off the hook's own `resolve`
+ * output instead, so the two can never disagree about whether a key exists.
+ * This exists only to obtain a USABLE VALUE for the probe `doctor` sends
+ * itself, because the hook deliberately never prints the value
+ * (heartbeat.sh: "names are safe to print, values are not").
  */
-function resolveKey(env) {
+function resolveKey(env, exec = execFileSync) {
   const hook = (env.IDEABASE_HEARTBEAT_KEY || '').trim();
   if (hook) return { key: hook, source: 'IDEABASE_HEARTBEAT_KEY' };
   const mcp = (env.IDEA_BASE_API_KEY || '').trim();
   if (mcp) return { key: mcp, source: 'IDEA_BASE_API_KEY' };
+  try {
+    const getter = join(env.HOME || '', '.claude', 'core', 'secrets', 'get');
+    const out = exec(getter, ['idea-base-api-key'], { encoding: 'utf8', timeout: 5000 }).trim();
+    if (out) return { key: out, source: 'secrets/get(idea-base-api-key)' };
+  } catch { /* absent or failed - same silent-skip rule heartbeat.sh uses */ }
   return { key: null, source: null };
 }
 
@@ -185,18 +200,19 @@ export async function runDoctor({ env = process.env, fs = realFs, log = console.
 
   const taskId = (resolved.TASK_ID || '').trim();
   const issueId = (resolved.ISSUE || '').trim();
-  const { key, source: keySource } = resolveKey(env);
 
+  // THE ANCHOR CHECK RUNS BEFORE ANYTHING ABOUT THE KEY IS EVER PRINTED.
+  // idea-base.us#440 criterion 3: a no-anchor session used to see a `key:`
+  // line immediately above "NOT TRACKED", which reads as "the key is the
+  // problem" when it is not - there was never anything to send regardless.
   log('=== resolution (what the hook would send from here) ===');
   log(`  project dir : ${projectDir}`);
   log(`  task_id     : ${taskId || '(none)'}`);
   log(`  issue_id    : ${issueId || '(none)'}`);
   log(`  resolved by : ${resolved.ANCHOR_SOURCE || '(unrecorded)'}`);
-  log(`  key         : ${key ? `present via ${keySource}` : 'ABSENT'}`);
-  log(`  actor       : ${resolved.ACTOR || '(unset)'}`);
-  log('');
 
   if (!taskId && !issueId) {
+    log('');
     log('=== verdict: NOT TRACKED - no anchor ===');
     log('  This session has not declared what it is working on, so there is');
     log('  nothing truthful to send and nothing is sent. That is correct for a');
@@ -208,11 +224,35 @@ export async function runDoctor({ env = process.env, fs = realFs, log = console.
       detail: ['fix: call start_working(task_id) or set IDEABASE_TASK_ID'],
     };
   }
-  if (!key) {
+
+  // THE VERDICT COMES FROM THE HOOK, NOT FROM RE-DERIVING. `resolved.API_KEY`
+  // is the hook's own `resolve` output (heartbeat.sh:529) and already walks
+  // the real IDEABASE_HEARTBEAT_KEY -> IDEA_BASE_API_KEY -> secrets/get
+  // precedence, so trusting it here is what makes doctor's PRESENT/ABSENT
+  // verdict unable to diverge from what the hook actually does - the whole
+  // point of #440. `resolveKey` below mirrors that same precedence only to
+  // obtain a usable VALUE for the probe this function sends, since the hook
+  // deliberately never prints the value.
+  const hookKeyPresent = (resolved.API_KEY || '').trim() === 'present';
+  const { key, source: keySource } = resolveKey(env, exec);
+  log(`  key         : ${hookKeyPresent ? `present via ${keySource || '(hook-confirmed)'}` : 'ABSENT'}`);
+  log(`  actor       : ${resolved.ACTOR || '(unset)'}`);
+  log('');
+
+  if (!hookKeyPresent) {
     log('=== verdict: NO KEY ===');
-    log('  Neither IDEABASE_HEARTBEAT_KEY nor IDEA_BASE_API_KEY is set here, so');
-    log('  the probe cannot be sent. Note the key must have WRITE scope.');
-    return { code: 2, verdict: 'NO KEY - nothing could be sent', detail: ['set IDEABASE_HEARTBEAT_KEY (write scope)'] };
+    log('  The hook (resolve) found no credential here - checked');
+    log('  IDEABASE_HEARTBEAT_KEY, IDEA_BASE_API_KEY, then the secrets store.');
+    log('  Note the key must have WRITE scope.');
+    return { code: 2, verdict: 'NO KEY - nothing could be sent', detail: ['set IDEABASE_HEARTBEAT_KEY or IDEA_BASE_API_KEY (write scope)'] };
+  }
+  if (!key) {
+    // Should never happen - resolveKey mirrors the hook's own precedence
+    // exactly - but never send a probe without an actual value in hand.
+    log('=== verdict: COULD NOT ASK THE HOOK ===');
+    log('  The hook reports a key resolves, but this process could not obtain');
+    log('  the same value itself.');
+    return { code: 2, verdict: 'COULD NOT ASK THE HOOK', detail: ['key presence and key value disagreed'] };
   }
 
   // The probe's session id is deliberately NOT a real harness session id, so a
