@@ -45,21 +45,32 @@ import {
   assessInstall,
   planMerge,
   readSettings,
+  sha256,
   HOOK_SCRIPT_REL,
 } from './setup.js';
 import { buildInventory, probeRemote } from './features.js';
 import { renderSetupReport, renderFeaturesReport, renderInstallPlan } from './render.js';
+import {
+  PACKAGE_VERSION,
+  UPDATE_COMMAND,
+  fetchLatestVersion,
+  isNewer,
+  readProvenance,
+  planScriptRefresh,
+  SCRIPT_STATE,
+} from './update.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-export const SUBCOMMANDS = new Set(['install', 'doctor', 'features', 'setup']);
+export const SUBCOMMANDS = new Set(['install', 'update', 'doctor', 'features', 'setup']);
 
 function parseFlags(argv) {
-  const flags = { apply: false, actor: null, json: false };
+  const flags = { apply: false, actor: null, json: false, dryRun: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') flags.apply = true;
     else if (a === '--json') flags.json = true;
+    else if (a === '--dry-run') flags.dryRun = true;
     else if (a === '--actor') { flags.actor = (argv[i + 1] || '').trim() || null; i += 1; }
     else if (a.startsWith('--actor=')) flags.actor = a.slice(8).trim() || null;
   }
@@ -414,6 +425,189 @@ export async function runInstall({ env = process.env, fs = realFs, log = console
 }
 
 // ---------------------------------------------------------------------------
+// update (#448)
+// ---------------------------------------------------------------------------
+/**
+ * Move an existing install forward: refresh the files this package wrote,
+ * re-assert the hook registrations, then run the doctor check and say plainly
+ * where the customer stands.
+ *
+ * WHY THIS WRITES BY DEFAULT WHILE `install` REQUIRES `--apply`.
+ * `install` is a first contact with a project that may already be configured by
+ * hand, so it shows a plan and waits. `update` is asked for by name, and the
+ * only file it will ever replace is one whose bytes it recognises as a copy it
+ * shipped itself (planScriptRefresh). A copy the customer edited is refused, not
+ * merged and not overwritten. So there is nothing here for a confirmation step
+ * to protect, and making the one command the issue asks for into two would
+ * defeat its purpose. `--dry-run` previews anyway.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO: touch npm. Running
+ * `npx @idea-base/mcp-server@latest update` IS the npm work - npx resolves and
+ * fetches `latest` in order to run this code at all. How the customer's CLIENT
+ * launches the server (a bare `npx`, a pinned version, a global `-g` install, a
+ * lockfile) is their configuration, and a command that guessed at it and
+ * "fixed" it would be reaching outside what it can see. So the restart is named
+ * and not performed - the CEO's own framing on #448: "Sure we can't restart but
+ * that's not entirely our problem to solve."
+ *
+ * EXIT CODE IS ABOUT THE UPDATE, NOT ABOUT THE TRACKING. A clean install on a
+ * machine with no API key updates perfectly and is still not tracking anything;
+ * reporting that as a failed update would be a lie in the expensive direction,
+ * because the next thing a customer does with a non-zero exit is re-run it. The
+ * doctor verdict is printed in full and returned, so a caller that cares can
+ * read it - exactly the 1-vs-2 distinction runDoctor already makes.
+ */
+export async function runUpdate({
+  env = process.env,
+  fs = realFs,
+  log = console.log,
+  argv = [],
+  doctor = runDoctor,
+  fetchLatest = fetchLatestVersion,
+} = {}) {
+  const flags = parseFlags(argv);
+  const { dir: projectDir, source: dirSource } = resolveProjectDir(env);
+  const local = inspectLocal({ projectDir, env, fs });
+
+  const latest = await fetchLatest({ env });
+
+  log('=== IDEA Base MCP update ===');
+  log(`  this package    : ${PACKAGE_VERSION}`);
+  log(`  latest on npm   : ${latest.version || `unknown (${latest.error})`}`);
+  log(`  project         : ${projectDir}  (via ${dirSource})`);
+  if (latest.version && isNewer(latest.version, PACKAGE_VERSION)) {
+    // Reachable when the customer ran a pinned or cached copy rather than
+    // @latest. Saying so beats refreshing their files from a version that is
+    // itself behind and reporting success.
+    log('');
+    log(`  NOTE: ${latest.version} is published but this is ${PACKAGE_VERSION}, so you are`);
+    log(`  running an older copy of the updater. Re-run as:  ${UPDATE_COMMAND}`);
+  }
+  log('');
+
+  if (local.parseError) {
+    log(`REFUSING: ${local.settingsPath} - ${local.parseError}`);
+    log('A file I cannot parse is not an empty file; rewriting it would delete');
+    log('every hook you have. Fix the JSON and run this again.');
+    return { code: 1, applied: false, script: null, doctor: null };
+  }
+
+  // --- the installed script ------------------------------------------------
+  const provenance = readProvenance({ fs });
+  const assetPath = join(HERE, 'assets', 'heartbeat.sh');
+  let assetBody = null;
+  try {
+    assetBody = fs.readFileSync(assetPath, 'utf8');
+  } catch {
+    assetBody = null;
+  }
+
+  let shippedSha = null;
+  if (assetBody === null) {
+    // Same `files` footgun install refuses on: an asset left out of the
+    // published tarball is absent for every customer while working perfectly
+    // from a git checkout.
+    log(`WARNING: the packaged hook script is missing at ${assetPath}.`);
+    log('This build cannot refresh it. Your existing copy is left untouched.');
+  } else {
+    shippedSha = sha256(assetBody);
+    if (provenance.sha256 && provenance.sha256 !== shippedSha) {
+      // The manifest and the asset disagree, so this build does not know what
+      // it ships. Refusing to write is the only safe branch: the alternative
+      // is replacing a customer's file with bytes we cannot vouch for.
+      log(`WARNING: this build's heartbeat.sh (${shippedSha.slice(0, 12)}) does not match its own`);
+      log(`manifest (${provenance.sha256.slice(0, 12)}). Not touching your copy.`);
+      shippedSha = null;
+    }
+  }
+
+  const scriptPlan = planScriptRefresh({
+    installedSha: local.script.present ? local.script.sha256 : null,
+    shippedSha,
+    knownShas: provenance.knownShas,
+  });
+
+  log('--- installed files ---');
+  log(`  ${HOOK_SCRIPT_REL}`);
+  log(`    ${scriptPlan.detail}`);
+
+  const destPath = join(projectDir, HOOK_SCRIPT_REL);
+  let wroteScript = false;
+  if (scriptPlan.refresh && !flags.dryRun) {
+    fs.mkdirSync(dirname(destPath), { recursive: true });
+    fs.writeFileSync(destPath, assetBody, 'utf8');
+    try { fs.chmodSync(destPath, 0o755); } catch { /* best effort; invoked via `sh` */ }
+    wroteScript = true;
+    log(`    wrote ${destPath}`);
+  } else if (scriptPlan.refresh) {
+    log('    (--dry-run: not written)');
+  }
+  log('');
+
+  // --- the hook registrations ---------------------------------------------
+  // planMerge, unchanged from install. structuredClone keeps every unrelated
+  // key - other tools' hooks, permissions, env, statusLine - byte-for-byte, so
+  // "preserves unrelated hooks and settings" is a property of the merge rather
+  // than a promise made here.
+  const actor = flags.actor || local.actorEffective || null;
+  const plan = planMerge(local.settings ?? {}, { actor });
+
+  log('--- hook registrations ---');
+  if (plan.idempotent) {
+    log(`  already correct - ${local.settingsExists ? `${local.settingsPath} left byte-identical` : 'nothing to write'}`);
+  } else {
+    for (const c of plan.changes) log(`  * ${c.detail}`);
+  }
+  if (local.foreignHooks) {
+    log(`  (${local.foreignHooks} hook${local.foreignHooks === 1 ? '' : 's'} belonging to other tools, untouched)`);
+  }
+
+  let wroteSettings = false;
+  if (!plan.idempotent && !flags.dryRun) {
+    fs.mkdirSync(dirname(local.settingsPath), { recursive: true });
+    fs.writeFileSync(local.settingsPath, `${JSON.stringify(plan.next, null, 2)}\n`, 'utf8');
+    wroteSettings = true;
+    log(`  updated ${local.settingsPath}`);
+  } else if (!plan.idempotent) {
+    log('  (--dry-run: not written)');
+  }
+  log('');
+
+  if (flags.dryRun) {
+    log('=== verdict: DRY RUN - nothing was written ===');
+    log(`  Run without --dry-run to apply, then restart your session.`);
+    return { code: 0, applied: false, script: scriptPlan, plan, doctor: null, dryRun: true };
+  }
+
+  // --- the doctor check (criterion 3) -------------------------------------
+  log('--- doctor ---');
+  const doc = await doctor({ env, fs, log: (s) => log(`  ${s}`) });
+  log('');
+
+  log('=== verdict ===');
+  const changed = [];
+  if (wroteScript) changed.push(HOOK_SCRIPT_REL);
+  if (wroteSettings) changed.push('.claude/settings.json');
+  log(changed.length
+    ? `  Updated: ${changed.join(', ')}.`
+    : '  Nothing needed changing - this install was already current.');
+  if (scriptPlan.state === SCRIPT_STATE.MODIFIED && local.script.present) {
+    log(`  Your ${HOOK_SCRIPT_REL} was left as you wrote it (see above).`);
+  }
+  log(`  Tracking check: ${doc.verdict}`);
+  log('');
+  // Said unconditionally, including when nothing was written, because the
+  // customer may well have updated the PACKAGE (npx fetched a new one to run
+  // this) even when neither installed file needed changing - and the running
+  // server in their session is still the old one either way.
+  log('  RESTART REQUIRED: a running MCP server keeps the code it started with.');
+  log('  Nothing you just did reaches the session you are in now - start a new');
+  log('  session (or restart your editor) to load this version.');
+
+  return { code: 0, applied: wroteScript || wroteSettings, script: scriptPlan, plan, doctor: doc };
+}
+
+// ---------------------------------------------------------------------------
 // features / setup (CLI forms of the two prompts)
 // ---------------------------------------------------------------------------
 export async function runFeatures({ env = process.env, fs = realFs, log = console.log } = {}) {
@@ -449,6 +643,7 @@ export async function runCli(argv, { env = process.env, fs = realFs, log = conso
   const [sub, ...rest] = argv;
   switch (sub) {
     case 'install': return runInstall({ env, fs, log, argv: rest });
+    case 'update': return runUpdate({ env, fs, log, argv: rest });
     case 'doctor': return runDoctor({ env, fs, log });
     case 'features': return runFeatures({ env, fs, log });
     case 'setup': return runSetup({ env, fs, log });
