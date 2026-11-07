@@ -19,6 +19,15 @@ import {
   ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
 import { runCli, SUBCOMMANDS, runSetup, runFeatures } from './cli.js';
+import {
+  PACKAGE_VERSION,
+  UPDATE_COMMAND,
+  startVersionCheck,
+  updateNoticeText,
+  fetchLatestVersion,
+  isNewer,
+  updateCheckDisabled,
+} from './update.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -1968,7 +1977,7 @@ const server = new Server(
     // Kept in step with package.json by a test; it had drifted to 1.0.0 while
     // the package was at 2.5.0, so the version a client reported bore no
     // relation to the one installed.
-    version: '2.8.0',
+    version: '2.9.0',
   },
   {
     capabilities: {
@@ -2013,6 +2022,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // returns the untouched result, because a broken suffix must not break a write.
 let nudgeSpent = false;
 
+// ---------------------------------------------------------------------------
+// THE UPDATE NOTICE (#448) — and why it reads a variable instead of asking npm
+// ---------------------------------------------------------------------------
+// Criterion 4: tell the customer an update exists "without failing or slowing
+// any tool call when npm cannot be reached". So this function does NO I/O at
+// all. The registry lookup was fired once in main(), un-awaited; all this does
+// is read whatever it settled on, synchronously.
+//
+// When npm is unreachable the variable is simply never set, nothing is said,
+// and no tool call is a microsecond slower — there is no slow path to measure,
+// because there is no await. An awaited lookup here, however short its timeout,
+// would charge every customer behind a blocked egress that timeout on a real
+// write.
+//
+// Same two restraints as the nudge above: once per process, and only when there
+// is something true to say (updateNoticeText returns '' when we are current,
+// when the answer is unknown, and when we are AHEAD of the registry — which is
+// what a maintainer running an unpublished build sees).
+let updateNoticeSpent = false;
+
+function updateNudge() {
+  if (updateNoticeSpent) return '';
+  const text = updateNoticeText();
+  // Only spend it on a notice actually produced. Spending it on the first call —
+  // which is usually before the background lookup has settled — would mean the
+  // notice never appeared at all.
+  if (!text) return '';
+  updateNoticeSpent = true;
+  return text;
+}
+
 async function firstUseNudge() {
   if (nudgeSpent) return '';
   nudgeSpent = true;
@@ -2045,7 +2085,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const safeArgs = validateArgs(name, tool.inputSchema, args);
     const result = await handler(safeArgs);
     try {
-      const nudge = await firstUseNudge();
+      const nudge = `${await firstUseNudge()}${updateNudge()}`;
       if (nudge && !result?.isError && Array.isArray(result?.content)) {
         const last = result.content[result.content.length - 1];
         if (last?.type === 'text' && typeof last.text === 'string') last.text += nudge;
@@ -2206,6 +2246,18 @@ const prompts = [
     name: 'features',
     description:
       'Inventory of IDEA Base capabilities as they are actually wired on THIS machine, not as the product advertises them: each one on, off, configured-but-not-firing, or undetermined - and for the undetermined ones, why nothing here can tell.',
+    arguments: [],
+  },
+  // --- #448 -----------------------------------------------------------------
+  // A prompt can only return TEXT, so this one reports and points; the terminal
+  // command does the work. That split is forced rather than chosen: there is no
+  // MCP primitive for writing a customer's files, and an old server cannot
+  // offer a prompt it does not have - so the update path could never be
+  // bootstrapped from the prompt side alone.
+  {
+    name: 'update',
+    description:
+      'Report the installed and the latest published version of the IDEA Base MCP server, and give the one command that updates it and refreshes the files it installed in this repo. Reads only; the command does the work, and a session restart is what loads a new server.',
     arguments: [],
   },
 ];
@@ -2422,12 +2474,79 @@ async function buildFeaturesPrompt() {
   ].join('\n'));
 }
 
+/**
+ * #448 criterion 5. Reports both versions and gives the same one command the
+ * notice gives.
+ *
+ * This one DOES await the registry, unlike the tool-path notice, and the
+ * difference is deliberate: a prompt is a thing the customer deliberately asked
+ * for and is willing to wait a moment for, where a tool call is not. It is
+ * still bounded and still degrades to a stated unknown rather than an error -
+ * "I could not ask npm" and "you are current" must never look the same.
+ */
+async function buildUpdatePrompt() {
+  const latest = await fetchLatestVersion();
+  const lines = [
+    '=== IDEA Base MCP — versions ===',
+    `  running in this session : ${PACKAGE_VERSION}`,
+    `  latest published on npm : ${latest.version || `could not ask npm (${latest.error})`}`,
+    '',
+  ];
+
+  if (!latest.version) {
+    lines.push(
+      'The registry could not be reached, so whether you are behind is UNKNOWN —',
+      'which is not the same as up to date. The command below is safe to run',
+      'either way; it is a no-op when there is nothing to change.',
+    );
+  } else if (isNewer(latest.version, PACKAGE_VERSION)) {
+    lines.push(`An update is available: ${PACKAGE_VERSION} -> ${latest.version}.`);
+  } else if (isNewer(PACKAGE_VERSION, latest.version)) {
+    lines.push(
+      `This session is running ${PACKAGE_VERSION}, which is AHEAD of the published`,
+      `${latest.version} — an unpublished or locally linked build. Nothing to update.`,
+    );
+  } else {
+    lines.push('You are on the latest published version. Nothing to update.');
+  }
+
+  lines.push(
+    '',
+    '=== to update ===',
+    '',
+    `    ${UPDATE_COMMAND}`,
+    '',
+    'Run it in the repository you want tracked. It updates the package, refreshes',
+    'the files the package installed here (.claude/hooks/heartbeat.sh — leaving any',
+    'edits of your own alone), re-asserts the three hook registrations without',
+    'touching your other hooks or settings, and finishes by running the doctor',
+    'check so you can see whether tracking actually works.',
+    '',
+    'THEN RESTART. A running MCP server keeps the code it started with, so none of',
+    'the above reaches this session — start a new session, or restart your editor.',
+  );
+
+  if (updateCheckDisabled(process.env)) {
+    lines.push('', 'Note: IDEA_BASE_UPDATE_CHECK is off, so this server will not volunteer update notices.');
+  }
+
+  return textMessage([
+    lines.join('\n'),
+    '',
+    '---',
+    'Read-only: this prompt changed nothing. Show the command to the user; do not',
+    'run it for them without asking, and do not report the update as done — only a',
+    'restarted session is running the new code.',
+  ].join('\n'));
+}
+
 const promptBuilders = {
   start_sprint: buildStartSprint,
   sprint_report: buildSprintReport,
   plan_sprint: buildPlanSprint,
   setup: buildSetupPrompt,
   features: buildFeaturesPrompt,
+  update: buildUpdatePrompt,
 };
 
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {
@@ -2474,6 +2593,19 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('IDEA Base MCP Server running on stdio');
+
+  // #448: fire the version lookup here, AFTER the transport is up, and never
+  // await it. Three properties are load-bearing and all three are structural
+  // rather than careful:
+  //   * not awaited, so it cannot delay startup or any tool call;
+  //   * `.catch` attached, so an unreachable registry cannot raise an unhandled
+  //     rejection — which on Node 20 terminates the process by default, turning
+  //     a cosmetic notice into a server that will not start;
+  //   * after `connect`, so a slow DNS answer cannot sit in front of the
+  //     handshake.
+  // The tool path reads only what this settles on, synchronously. See
+  // updateNudge above.
+  startVersionCheck().catch(() => {});
 }
 
 main().catch((error) => {

@@ -88,6 +88,7 @@ server in your MCP config.
 | `/idea-base:plan_sprint <product_id>` | Cadence, the next window, the eligible pool, and what is held back as blocked. |
 | `/idea-base:setup` | Whether this project emits session tracking, every missing piece with the literal text to add, and a live check that a heartbeat actually lands. Writes nothing. |
 | `/idea-base:features` | What is wired on **this machine** — each capability on, off, configured-but-not-firing, or undetermined with the reason. Read-only. |
+| `/idea-base:update` | The installed version, the latest published one, and the one command that updates both the package and what it installed here. Reports; the command does the work. See [Updating](#updating). |
 
 Tracker text in these results is fenced as data, and item lists are capped with
 the true total printed.
@@ -104,7 +105,12 @@ npx @idea-base/mcp-server install          # DRY RUN — prints the plan, writes
 npx @idea-base/mcp-server install --apply --actor <agent-user-id>
 npx @idea-base/mcp-server doctor           # does a heartbeat actually land?
 npx @idea-base/mcp-server features         # the inventory, read-only
+npx @idea-base/mcp-server@latest update    # move an existing install forward
 ```
+
+Already installed? [Updating](#updating) is the one you want — `install` leaves
+an existing `heartbeat.sh` alone on purpose, so it will not move an older one
+forward.
 
 **`install` is safe to run as often as you like.** It merges rather than
 overwrites: your other tools' hooks, your `permissions`, your `env` and
@@ -268,6 +274,60 @@ IDEA_BASE_API_KEY=your_key npm run dev
 IDEA_BASE_API_KEY=your_key node test/live-mcp.test.mjs
 IDEA_BASE_API_KEY=your_key node test/live-mcp.test.mjs --cmd "npx -y @idea-base/mcp-server@2.5.0"
 ```
+
+## Updating
+
+One command, run in the repository you want tracked:
+
+```sh
+npx @idea-base/mcp-server@latest update
+```
+
+`@latest` is the part that does the npm work — npx resolves and fetches the
+current version in order to run it. The command then:
+
+1. **Refreshes the files the package installed here.** Today that is
+   `.claude/hooks/heartbeat.sh`. `install` deliberately *skips* a script that is
+   already present (an installer that clobbers on every run is worse), which
+   means an install made at an older version stayed at that version with nothing
+   saying so. This is the command that moves it forward.
+2. **Re-asserts the three hook registrations**, merging exactly as `install`
+   does — your other tools' hooks, your `permissions`, your `env` and everything
+   else in `.claude/settings.json` are preserved, and a second run leaves both
+   files byte-identical.
+3. **Runs `doctor`** and prints its verdict, so you finish knowing whether
+   tracking actually works rather than whether files were copied.
+
+**A script you edited yourself is never overwritten.** The decision is made by
+sha256 against the list of bodies this package has ever published
+(`src/assets/heartbeat.provenance.json`, `known_shas`):
+
+| Your `heartbeat.sh` | What happens |
+| --- | --- |
+| the current version | nothing is written |
+| an older version we shipped | refreshed, with both sha256s printed |
+| absent | written |
+| anything else | **left exactly as it is**, and reported |
+
+`--dry-run` prints all of the above and writes nothing.
+
+**Then restart.** A running MCP server keeps the code it started with, so none
+of this reaches the session you ran it from — start a new session, or restart
+your editor. The command says so on every run; it does not pretend to restart
+anything for you.
+
+### Knowing you are behind
+
+A running server tells you once, on the first tool call of the session, when a
+newer version is published — and tells you the same command. `/idea-base:update`
+reports the installed and latest versions on demand.
+
+The check is one unauthenticated `GET` to the npm registry for this package's
+`latest` dist-tag: no credential, no request body, and nothing about you, your
+project or your data. It is fired once at startup and **never awaited on the
+tool path**, so an unreachable registry costs no tool call any time at all — it
+simply says nothing, because "I could not ask" and "you are up to date" must not
+look the same. Set `IDEA_BASE_UPDATE_CHECK=off` to disable it entirely.
 
 ## Releasing
 

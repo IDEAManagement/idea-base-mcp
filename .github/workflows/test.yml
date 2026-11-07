@@ -56,7 +56,7 @@ jobs:
           node -e '
             const files = require("/tmp/pack.json")[0].files.map(f => f.path);
             const required = [
-              "src/index.js", "src/cli.js", "src/setup.js",
+              "src/index.js", "src/cli.js", "src/setup.js", "src/update.js",
               "src/features.js", "src/render.js",
               "src/assets/heartbeat.sh", "src/assets/heartbeat.provenance.json",
             ];

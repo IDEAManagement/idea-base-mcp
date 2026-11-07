@@ -1,5 +1,55 @@
 # Changelog
 
+## 2.9.0 — 2026-11-07
+
+**A customer can update.** Tracks `idea-base.us#448` / task 990942. Carries
+2.8.0's `report_bug`, which was merged but never published.
+
+### Added
+
+- **`update` subcommand.** `npx @idea-base/mcp-server@latest update` refreshes
+  the files the package installed in a repo, re-asserts the three hook
+  registrations, runs `doctor`, and states that a session restart is what loads
+  the new server. `--dry-run` previews.
+
+  This closes a gap nothing reported: `install` guards its only write with
+  `if (!local.script.present)`, so an existing `.claude/hooks/heartbeat.sh` was
+  skipped and a re-run answered *"Nothing to do - already installed correctly"*
+  over a file from an older version. Skipping is still the right default for
+  `install` and is unchanged; `update` is the verb that moves it forward.
+
+- **A script the customer edited is never overwritten.** The refresh is decided
+  by sha256 against `known_shas` in `src/assets/heartbeat.provenance.json` — the
+  list of every body this package has published. An older one of ours is
+  refreshed with both shas printed; anything else is left exactly as it is and
+  said so. **APPEND to that list when re-vendoring**: dropping an entry
+  reclassifies every customer still on that version as having edited the file.
+
+- **Update notice on a running server.** Once per process, on the first tool
+  call, when a newer version is published. The registry lookup is fired once at
+  startup and **never awaited on the tool path** — the handler reads a settled
+  module variable — so an unreachable registry costs no tool call any time and
+  simply says nothing. One unauthenticated `GET` for the `latest` dist-tag: no
+  credential, no body, nothing about the customer. `IDEA_BASE_UPDATE_CHECK=off`
+  disables it.
+
+- **`/idea-base:update`** reports the installed and latest versions and gives the
+  same command. A prompt can only return text, so the terminal command does the
+  work — and an old server cannot offer a new prompt, which is why the command
+  and not the prompt is the bootstrap.
+
+- `src/update.test.js` — 34 assertions, offline, including a real OS process
+  against an empty `HOME` and a repo holding only a customer install, and the
+  control test that pins `install`'s skip so nobody "fixes" it into a clobber.
+
+### Fixed
+
+- `fetchLatestVersion` enforces its own deadline rather than relying on the
+  abort signal alone. Found while verifying this change: against a transport that
+  accepts the connection and then streams nothing, `/idea-base:update` (which
+  does await the lookup) hung indefinitely, because an `AbortSignal` binds only a
+  fetch implementation that honours it.
+
 ## 2.8.0 — 2026-11-07
 
 **New tool: `report_bug`.** Tracks `idea-base.us#442` / task 990929.

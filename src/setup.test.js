@@ -874,7 +874,7 @@ describe('the packaged hook script', () => {
     // checkout - and installing hooks that point at a missing script fails
     // CLOSED and can deny Bash and Edit.
     const pkg = JSON.parse(readFileSync(join(HERE, '..', 'package.json'), 'utf8'));
-    for (const f of ['src/assets/heartbeat.sh', 'src/cli.js', 'src/setup.js', 'src/features.js', 'src/render.js']) {
+    for (const f of ['src/assets/heartbeat.sh', 'src/cli.js', 'src/setup.js', 'src/update.js', 'src/features.js', 'src/render.js']) {
       assert.ok(pkg.files.includes(f), `${f} is missing from package.json "files" and would not be published`);
     }
   });
