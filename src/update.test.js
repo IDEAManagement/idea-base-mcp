@@ -342,6 +342,30 @@ describe('criterion 2 - unrelated hooks and settings survive, and a second run i
     assert.match(out, /REFUSING/);
   });
 
+  test('--help writes nothing, asks npm nothing, and explains instead', async () => {
+    // v2.9.0 shipped with `update --help` PERFORMING the update: parseFlags
+    // ignores an unrecognised flag, which is harmless for `install` (whose
+    // default is a dry run) and is not harmless for a command that writes.
+    // Found by an independent verifier after publishing.
+    let askedNpm = false;
+    const fs = staleProject();
+    for (const flag of ['--help', '-h']) {
+      fs.writes.length = 0;
+      const { code, out } = await update(fs, {
+        argv: [flag],
+        fetchLatest: async () => { askedNpm = true; return { version: null, error: 'should not be called' }; },
+        doctor: stubDoctor(),
+      });
+      assert.equal(code, 0, flag);
+      assert.deepEqual(fs.writes, [], `${flag} wrote nothing`);
+      assert.equal(fs.files[SCRIPT], OLD_BODY, `${flag} left the stale script alone`);
+      assert.match(out, /^Usage:\s+npx @idea-base\/mcp-server@latest update/, `${flag} prints usage`);
+      assert.match(out, /A session restart is what loads a new server/);
+      assert.ok(!/RESTART REQUIRED/.test(out), 'and does not pretend it just updated anything');
+    }
+    assert.equal(askedNpm, false, '--help is answered before anything is asked of npm');
+  });
+
   test('--dry-run writes nothing and says so', async () => {
     const fs = staleProject();
     const { out, code } = await update(fs, { argv: ['--dry-run'] });

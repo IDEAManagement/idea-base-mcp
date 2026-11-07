@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.9.1 — 2026-11-07
+
+### Fixed
+
+- **`update --help` performed the update.** `parseFlags` ignores an unrecognised
+  flag, which is harmless for `install` — its default is a dry run — and is not
+  harmless for a command that writes: someone asking a question got an action.
+  `update` now prints usage and exits before reading the filesystem or asking
+  npm anything. `-h` too.
+
+  Found by an independent verifier grading `idea-base.us#448` **after** 2.9.0 had
+  published, which is why this is a patch release rather than part of it. The
+  test is red against 2.9.0 (`--help wrote nothing` / the script body appears in
+  the write log) and green here.
+
+  Only `update` gets a help screen. Giving every subcommand one is a larger
+  change than the defect warrants, and no other subcommand writes without
+  `--apply`.
+
 ## 2.9.0 — 2026-11-07
 
 **A customer can update.** Tracks `idea-base.us#448` / task 990942. Carries

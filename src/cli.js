@@ -65,17 +65,50 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const SUBCOMMANDS = new Set(['install', 'update', 'doctor', 'features', 'setup']);
 
 function parseFlags(argv) {
-  const flags = { apply: false, actor: null, json: false, dryRun: false };
+  const flags = { apply: false, actor: null, json: false, dryRun: false, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') flags.apply = true;
     else if (a === '--json') flags.json = true;
     else if (a === '--dry-run') flags.dryRun = true;
+    else if (a === '--help' || a === '-h') flags.help = true;
     else if (a === '--actor') { flags.actor = (argv[i + 1] || '').trim() || null; i += 1; }
     else if (a.startsWith('--actor=')) flags.actor = a.slice(8).trim() || null;
   }
   return flags;
 }
+
+// `update --help` USED TO PERFORM THE UPDATE.
+//
+// An unrecognised flag is simply ignored by parseFlags, which is harmless for
+// `install` (its default is a dry run) and is not harmless here: `update`
+// writes, so someone asking a question got an action. Found by an independent
+// verifier on idea-base.us#448 after v2.9.0 had already published.
+//
+// Only `update` gets this, deliberately. Giving every subcommand a help screen
+// is a bigger change than the defect warrants, and the other subcommands do not
+// write without `--apply`.
+const UPDATE_HELP = [
+  'Usage:  npx @idea-base/mcp-server@latest update [--dry-run] [--actor <agent-user-id>]',
+  '',
+  'Moves an existing install forward:',
+  '  * refreshes the files this package installed here (.claude/hooks/heartbeat.sh),',
+  '    leaving a copy you edited yourself exactly as it is;',
+  '  * re-asserts the three heartbeat hook registrations, preserving your other',
+  '    hooks and every unrelated key in .claude/settings.json;',
+  '  * runs the doctor check and prints whether tracking actually works.',
+  '',
+  'Running a second time changes nothing.',
+  '',
+  '  --dry-run            print everything above and write NOTHING',
+  '  --actor <id>         set env.IDEABASE_ACTOR; never guessed if omitted',
+  '',
+  'Environment:',
+  '  CLAUDE_PROJECT_DIR   the project to update (defaults to the current directory)',
+  '  IDEA_BASE_UPDATE_CHECK=off   do not ask npm whether a newer version exists',
+  '',
+  'A session restart is what loads a new server; this command cannot do that for you.',
+].join('\n');
 
 function apiBase(env) {
   const custom = (env.IDEA_BASE_API_URL || '').trim();
@@ -466,6 +499,14 @@ export async function runUpdate({
   fetchLatest = fetchLatestVersion,
 } = {}) {
   const flags = parseFlags(argv);
+
+  // Before ANY filesystem read and before asking npm anything: someone typing
+  // --help is asking a question, not requesting a write.
+  if (flags.help) {
+    log(UPDATE_HELP);
+    return { code: 0, applied: false, script: null, plan: null, doctor: null, help: true };
+  }
+
   const { dir: projectDir, source: dirSource } = resolveProjectDir(env);
   const local = inspectLocal({ projectDir, env, fs });
 
