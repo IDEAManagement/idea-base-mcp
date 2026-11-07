@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.8.0 — 2026-11-07
+
+**New tool: `report_bug`.** Tracks `idea-base.us#442` / task 990929.
+
+### Added
+
+- `report_bug` files a support ticket through the existing Help Desk intake
+  (`POST /api/tickets`, category `bug`) rather than opening a second one. An
+  agent or an MCP-only customer previously had no path to tell staff about a
+  problem in IDEA Base itself. A read-only API key is refused by the
+  existing `API_KEY_READ_ONLY` check — the same rule every other write tool
+  already gets, verified live against production for this change.
+
 ## 2.7.1 — 2026-11-06
 
 **`doctor` and the heartbeat hook now agree about the API key.** Tracks

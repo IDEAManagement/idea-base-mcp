@@ -228,6 +228,12 @@ For AI agents, these leave a durable trail of *what was done and why* on each ta
 | `create_product` | Create a new product |
 | `link_project_to_product` | Link a project to a product |
 
+### Support
+
+| Tool | Description |
+|------|-------------|
+| `report_bug` | File a bug report against IDEA Base itself through the existing Help Desk intake (`POST /api/tickets`, category `bug`) — not a second intake path. Staff see it in the Help Desk queue. A read-only API key is refused. |
+
 ## Environment Variables
 
 | Variable | Required | Description |

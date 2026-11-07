@@ -1169,6 +1169,34 @@ const tools = [
       required: ['product_id', 'project_id'],
     },
   },
+  // Support
+  {
+    name: 'report_bug',
+    description: 'File a bug report against IDEA Base itself as a support ticket, through the existing Help Desk intake (POST /api/tickets, category "bug") — not a second intake path. Use this when something in IDEA Base is broken, not for a customer project\'s own bugs. Staff see it in the Help Desk queue.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        subject: {
+          type: 'string',
+          description: 'Short summary of the bug (the ticket subject)',
+        },
+        description: {
+          type: 'string',
+          description: 'What happened, steps to reproduce, and expected vs. actual behavior',
+        },
+        priority: {
+          type: 'string',
+          enum: ['low', 'normal', 'high', 'urgent'],
+          description: 'Defaults to normal',
+        },
+        project_id: {
+          type: 'number',
+          description: 'Optional: the IDEA Base project this bug relates to',
+        },
+      },
+      required: ['subject'],
+    },
+  },
 ];
 
 // Tool implementation handlers
@@ -1915,6 +1943,22 @@ const toolHandlers = {
       ],
     };
   },
+
+  // Support handler
+  async report_bug({ subject, description, priority, project_id }) {
+    const ticket = await apiRequest('/tickets', {
+      method: 'POST',
+      body: JSON.stringify({ subject, description, category: 'bug', priority, project_id }),
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Bug reported as ticket #${ticket.id} (status: ${ticket.status}, priority: ${ticket.priority}). Staff will see it in the Help Desk queue.`,
+        },
+      ],
+    };
+  },
 };
 
 // Create and configure the MCP server
@@ -1924,7 +1968,7 @@ const server = new Server(
     // Kept in step with package.json by a test; it had drifted to 1.0.0 while
     // the package was at 2.5.0, so the version a client reported bore no
     // relation to the one installed.
-    version: '2.7.1',
+    version: '2.8.0',
   },
   {
     capabilities: {
