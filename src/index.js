@@ -767,7 +767,7 @@ const tools = [
   },
   {
     name: 'log_time',
-    description: 'Log time spent on a task. This triggers a real-time notification showing time was logged.',
+    description: 'Log MEASURED time on a task — time you actually observed, never an estimate and never a guess.\n\nIN ALMOST EVERY CASE YOU SHOULD NOT CALL THIS. Use start_working and stop_working instead: stop_working writes the task\'s time entry itself, from the work session\'s measured duration, read back out of the database. You have no clock, so a number you type here is a guess about how long something felt.\n\nAn estimate goes in the task\'s `estimated_minutes` (create_task / update_task), NOT here. Logged time is a measurement; an estimate is a plan. They are different fields and must not be confused — writing an estimate into logged time is what this tool\'s description used to invite, and an agent did it: 75 minutes logged for work its own sessions measured at 15.7, 14.5 and 8.1.\n\nUse it ONLY for work no session measured — something done away from the keyboard, or work from before you started a session — and say in the notes why there is no measurement. An AGENT logging by hand on a task that already has measured time is REFUSED, whatever the amount. Negative minutes are refused too: correct the original entry rather than filing an offsetting one.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -777,11 +777,11 @@ const tools = [
         },
         minutes: {
           type: 'number',
-          description: 'Number of minutes to log',
+          description: 'Minutes you MEASURED. Must be positive. Not an estimate — an estimate belongs in estimated_minutes. If you did not measure it, do not call this tool.',
         },
         notes: {
           type: 'string',
-          description: 'Notes about what was done during this time',
+          description: 'What was done during this time — and, since this is a hand entry, why no work session measured it.',
         },
         date: {
           type: 'string',
@@ -832,7 +832,7 @@ const tools = [
   },
   {
     name: 'quick_log',
-    description: 'Quick workflow for logging completed work: creates a task, marks it done, and logs time in one call. Ideal for recording work that has already been completed.',
+    description: 'Quick workflow for recording work that is ALREADY FINISHED: creates a task, marks it done, and logs time in one call.\n\n`minutes` must be MEASURED time, not an estimate. This is a hand-entry path — there is no work session behind it — so only use it for work you actually observed the duration of, and prefer start_working / stop_working whenever the work is still ahead of you, because stop_working writes the time entry from the measured session and you type no number at all.\n\nAn estimate goes in `estimated_minutes`, which is a separate optional argument here precisely so the two cannot be the same number by accident. Omit it and it defaults to `minutes`, as before.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -846,7 +846,11 @@ const tools = [
         },
         minutes: {
           type: 'number',
-          description: 'Number of minutes spent on this work',
+          description: 'Minutes you MEASURED spending on this work. Must be positive. Not an estimate — that is estimated_minutes.',
+        },
+        estimated_minutes: {
+          type: 'number',
+          description: 'What the task was ESTIMATED to take, if that is a different number from what it actually took (optional). Defaults to `minutes`.',
         },
         description: {
           type: 'string',
@@ -866,7 +870,7 @@ const tools = [
   },
   {
     name: 'start_working',
-    description: 'Start work on a task. Two things happen: you are shown to the team as actively working on it (and a todo task moves to in_progress), and a TIMED WORK SESSION is opened with a UTC start instant, so how long the task was actually worked becomes measurable instead of guessed.\n\nCalling it a second time on the same task NEVER opens a second session. If your session is paused it is resumed; if it is already running you are told so, with how long it has been going. The response always says which of the three happened.\n\nIt also orients a cold session: the response carries the task\'s resume context and its recent work notes, so read the whole thing before you start. Pair it with stop_working, and use pause_working when you have to wait on something.',
+    description: 'Start work on a task. Two things happen: you are shown to the team as actively working on it (and a todo task moves to in_progress), and a TIMED WORK SESSION is opened with a UTC start instant, so how long the task was actually worked becomes measurable instead of guessed.\n\nCalling it a second time on the same task NEVER opens a second session. If your session is paused it is resumed; if it is already running you are told so, with how long it has been going. The response always says which of the three happened.\n\nIt also orients a cold session: the response carries the task\'s resume context and its recent work notes, so read the whole thing before you start. Pair it with stop_working — which is what LOGS the time, from the measured session, with no number typed by you — and use pause_working when you have to wait on something.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -880,7 +884,7 @@ const tools = [
   },
   {
     name: 'stop_working',
-    description: 'Stop working on a task: close your open work session with a UTC end instant, and drop the "actively working" flag (you stay assigned). The closed session is what makes the task\'s worked duration reportable.\n\nRequires an open session — if you have none this FAILS and writes nothing, rather than inventing a session with no start. Call start_working first.\n\nThis ENDS the session. If you are only waiting on something and intend to carry on afterwards, use pause_working instead: a pause keeps the session open and records why you stopped, which is what decides whether the interval counts as worked time.\n\nOptionally capture your state on the way out: pass `note` to append a work note and/or `resume_context` to overwrite the resume block, so the next session can pick up where you left off.',
+    description: 'Stop working on a task: close your open work session with a UTC end instant, and drop the "actively working" flag (you stay assigned).\n\nTHIS IS WHAT LOGS YOUR TIME, and you supply no number. Closing the session writes the task\'s time entry from the session\'s measured worked duration — computed by the database from the recorded start and end instants, minus any waiting_on_human pause — and the response tells you the entry it wrote. Do NOT call log_time afterwards: the time is already recorded, and a hand entry on a task that already has measured time is refused. A session shorter than half a minute rounds to zero and logs nothing rather than being rounded up, and the response says so.\n\nRequires an open session — if you have none this FAILS and writes nothing, rather than inventing a session with no start. Call start_working first.\n\nThis ENDS the session. If you are only waiting on something and intend to carry on afterwards, use pause_working instead: a pause keeps the session open and records why you stopped, which is what decides whether the interval counts as worked time.\n\nOptionally capture your state on the way out: pass `note` to append a work note and/or `resume_context` to overwrite the resume block, so the next session can pick up where you left off.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1517,19 +1521,63 @@ const toolHandlers = {
   },
 
   async log_time({ task_id, minutes, notes, date }) {
-    const entry = await apiRequest(`/tasks/${task_id}/time`, {
-      method: 'POST',
-      body: JSON.stringify({
-        minutes,
-        notes,
-        date: date || new Date().toISOString().split('T')[0],
-      }),
-    });
+    // The backend refuses an agent's hand entry on a task that already has
+    // measured time (409 MEASURED_TIME_EXISTS) and refuses a negative entry
+    // (400 NEGATIVE_MINUTES). Those messages are written to be read by whoever
+    // called this, so pass them through rather than letting a bare "HTTP 409"
+    // reach the model — a refusal that does not say what to do instead gets
+    // retried, which is how a guard turns into a loop.
+    let result;
+    try {
+      result = await apiRequest(`/tasks/${task_id}/time`, {
+        method: 'POST',
+        body: JSON.stringify({
+          minutes,
+          notes,
+          date: date || new Date().toISOString().split('T')[0],
+        }),
+      });
+    } catch (error) {
+      const msg = String(error?.message || error);
+      if (/MEASURED_TIME_EXISTS/.test(msg) || /already has .* MEASURED time/i.test(msg)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `REFUSED — task ${task_id} already has MEASURED time from a closed work ` +
+                  `session, so there is no number for you to supply and nothing was logged.\n\n${msg}\n\n` +
+                  'Do not retry with a different number. If the work is not finished, start_working ' +
+                  'and let stop_working record it. If this was meant as an estimate, put it in the ' +
+                  'task\'s estimated_minutes with update_task.'
+          }],
+          isError: true,
+        };
+      }
+      if (/NEGATIVE_MINUTES/.test(msg)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `REFUSED — negative minutes are not accepted and nothing was logged.\n\n${msg}\n\n` +
+                  'Correct the original entry instead of filing an offsetting one.'
+          }],
+          isError: true,
+        };
+      }
+      throw error;
+    }
+
+    // Report what the SERVER stored, not what was asked for. The row carries
+    // `source`, and a hand entry is 'manual' — saying so at the call site is
+    // what keeps "I logged 45 minutes" from reading like a measurement.
+    const entry = result?.entry || {};
+    const stored = entry.minutes ?? minutes;
+    const provenance = entry.source === 'measured' ? 'measured' : 'hand-entered (source=manual)';
     return {
       content: [
         {
           type: 'text',
-          text: `Logged ${minutes} minutes to task ${task_id}. ${notes ? `Notes: ${notes}` : ''}`,
+          text: `Logged ${stored} minutes to task ${task_id} as ${provenance}.` +
+                (result?.total_minutes !== undefined ? ` Task total: ${result.total_minutes} minutes.` : '') +
+                (notes ? `\nNotes: ${notes}` : ''),
         },
       ],
     };
@@ -1555,15 +1603,24 @@ const toolHandlers = {
     };
   },
 
-  async quick_log({ project_id, title, minutes, description, notes, acceptance_criteria }) {
+  async quick_log({ project_id, title, minutes, estimated_minutes, description, notes, acceptance_criteria }) {
     // Step 1: Create the task
+    //
+    // `estimated_minutes` is now a separate optional argument. It used to be
+    // hardcoded to `minutes` with the comment "Use actual time as estimate
+    // since it's completed", which quietly made the estimate and the actual the
+    // same number on every quick_log — so this tool contradicted the very
+    // distinction its description now asks the caller to respect. Defaulting to
+    // `minutes` when it is omitted keeps the existing behaviour for every
+    // existing caller; passing it records what the task was actually expected
+    // to take.
     const task = await apiRequest(`/projects/${project_id}/tasks`, {
       method: 'POST',
       body: JSON.stringify({
         title,
         description,
         acceptance_criteria,
-        estimated_minutes: minutes, // Use actual time as estimate since it's completed
+        estimated_minutes: estimated_minutes ?? minutes,
       }),
     });
 
@@ -1694,6 +1751,7 @@ const toolHandlers = {
     // (the endpoint being unreachable, say) must not strand the presence flag,
     // so that one is reported and the stop continues.
     let timing = '';
+    let logged = '';
     let sessionError = null;
     try {
       const result = await apiRequest(`/tasks/${task_id}/work-session`, {
@@ -1706,6 +1764,23 @@ const toolHandlers = {
         ? ` (${s.elapsed_minutes} min elapsed, ${paused} min of that paused)`
         : '';
       timing = ` Work session #${s.id} closed at ${s.ended_at} — ${s.worked_minutes} minutes worked${pausedText}.`;
+
+      // The measured time entry the backend wrote (idea-base.us#455). Reported
+      // from the response, so the caller is told what LANDED rather than being
+      // left to assume — and told explicitly when nothing did. The old text
+      // reported a duration and said nothing about the ledger, which is how an
+      // agent could read "20 minutes worked" and still reach for log_time.
+      const e = result.time_entry;
+      if (e) {
+        logged = ` Time entry #${e.id} logged ${e.minutes} minutes as MEASURED — you do not need to call log_time.`;
+      } else if (result.time_entry_reason === 'rounds_to_zero') {
+        logged = ' No time entry: the session rounds to under a minute, so nothing was logged ' +
+                 'rather than rounding it up. Do not log it by hand.';
+      } else if (result.time_entry_reason === 'already_written') {
+        logged = ' This session had already been logged; no second entry was written.';
+      } else if (result.time_entry_reason) {
+        logged = ` No time entry was written (${result.time_entry_reason}).`;
+      }
     } catch (error) {
       sessionError = error;
     }
@@ -1729,7 +1804,7 @@ const toolHandlers = {
       content: [
         {
           type: 'text',
-          text: `Stopped working on task #${task_id}. You are still assigned to the task but no longer marked as actively working.${timing}${capturedText}`,
+          text: `Stopped working on task #${task_id}. You are still assigned to the task but no longer marked as actively working.${timing}${logged}${capturedText}`,
         },
       ],
     };
