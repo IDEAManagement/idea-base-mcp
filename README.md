@@ -189,21 +189,52 @@ Requires `curl` on `PATH`, a **write**-scoped API key, and Node 20+.
 | `update_task` | Update task details, priority, start/due dates, assignee; `blocked_by: [ids]` replaces its dependencies |
 | `update_task_status` | Change task status (todo/in_progress/blocked/done) |
 | `search_tasks` | Search tasks across all projects, ranked title-first then description then recency. Compact rows by default; filter by `project_id`/`product_id`/`customer_id`/`status`; `verbose:true` for full rows |
-| `quick_log` | Create + complete + log time in one step |
+| `quick_log` | Create + complete + log MEASURED time in one step; `estimated_minutes` is separate from `minutes` so the estimate and the actual need not be the same number |
 
 ### Time Tracking
 
 | Tool | Description |
 |------|-------------|
-| `log_time` | Log time against a task with notes |
+| `log_time` | Hand-log **measured** time against a task. Rarely what you want — see below. Refuses a negative entry, and refuses an agent entirely on a task that already has measured time |
 | `start_working` | Open a timed work session on a task, and mark yourself actively working (surfaces the saved resume context + recent work notes so a cold session re-orients). Calling it twice never opens a second session — it resumes or reports the one you have |
 | `pause_working` | Pause the open session without ending it, with a required `reason` |
 | `resume_working` | Close the pause and carry on in the same session |
-| `stop_working` | Close the session with a UTC end instant and drop the active flag (optionally capture a `note` and/or `resume_context` on the way out). Fails if you have no open session |
+| `stop_working` | Close the session with a UTC end instant, **write the task's time entry from the measured duration**, and drop the active flag (optionally capture a `note` and/or `resume_context` on the way out). Fails if you have no open session |
 
-**Sessions are measured, and the pause reason decides the number.** `start_working`
-records a UTC start instant, `stop_working` a UTC end instant, and each pause in
-between records both its boundaries plus why work stopped:
+**`stop_working` logs your time. You type no number.**
+
+An agent has no clock, so a duration it fills in by hand is a guess about how long
+the work felt. Closing a session writes the task's time entry from the session's
+measured worked duration — computed by the database from the recorded instants —
+and the response tells you the entry it wrote. Each entry records *how* its number
+was arrived at:
+
+| `source` | Meaning |
+|---|---|
+| `measured` | written by `stop_working` from a closed session. Nobody typed it |
+| `manual` | somebody supplied the number by hand |
+| *(unset)* | **unknown** — the entry predates provenance being recorded. Unknown is not measured |
+
+So: `start_working`, work, `stop_working`. Reach for `log_time` only for work no
+session measured, and say in the notes why there is no measurement. Two refusals
+you will meet if you ignore that:
+
+* an **agent** hand-logging on a task that already has measured time is refused
+  whatever the amount — the measurement exists, so there is nothing to supply;
+* **negative minutes are refused** on every path. Correct the original entry
+  rather than filing an offsetting one: a correction stored as a second row makes
+  the total a chain, and a reader entering it at the wrong row gets a wrong number
+  with nothing to signal it.
+
+An **estimate** is a different field — `estimated_minutes` on the task. An estimate
+is a plan and is allowed to be wrong; logged time is a measurement and is not.
+
+A session under half a minute rounds to zero and logs nothing, rather than being
+rounded up to a minute. That is deliberate — do not then log it by hand.
+
+**The pause reason decides the number.** `start_working` records a UTC start
+instant, `stop_working` a UTC end instant, and each pause in between records both
+its boundaries plus why work stopped:
 
 | `reason` | Effect on worked time |
 |---|---|
