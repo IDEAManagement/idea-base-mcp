@@ -2052,7 +2052,7 @@ const server = new Server(
     // Kept in step with package.json by a test; it had drifted to 1.0.0 while
     // the package was at 2.5.0, so the version a client reported bore no
     // relation to the one installed.
-    version: '2.9.1',
+    version: '2.10.0',
   },
   {
     capabilities: {

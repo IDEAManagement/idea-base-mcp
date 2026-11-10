@@ -50,30 +50,91 @@ function toolsFrom(src, label) {
   return new Map(arr.map((t) => [t.name, t]));
 }
 
-function baseRefWithout(path, sentinel) {
+// Resolve "the code before this change" by CONTENT, and distinguish THREE
+// outcomes rather than two. The distinction is the whole point and it was paid
+// for immediately: the first CI run of this file died because
+// `actions/checkout` clones with `fetch-depth: 1`, so there was exactly one
+// commit to walk and no pre-change version to find.
+//
+//   found      -> run the control
+//   NO HISTORY -> cannot ask. Report it and skip the control assertions.
+//   history, but every commit already has the sentinel -> THROW. That is
+//                "asked and got an answer that means this is not a control",
+//                which must never pass quietly.
+//
+// Collapsing the middle case into the third makes the suite unrunnable wherever
+// history is shallow (CI, a tarball, an export). Collapsing it into the first
+// is worse: the control would silently grade the new code twice. This repo's own
+// heartbeat-doctor encodes the same three-way as exit 0 / 1 / 2 for the same
+// reason — "could not ask" is not a verdict.
+function resolveBase(path, sentinel) {
   const git = (...a) => execFileSync('git', a, { cwd: repo, encoding: 'utf8' });
-  for (const rev of git('log', '-100', '--format=%H', '--', path).split('\n').filter(Boolean)) {
+
+  let revs;
+  try {
+    revs = git('log', '-100', '--format=%H', '--', path).split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch (e) {
+    return { ref: null, reason: `git log failed: ${e.message}` };
+  }
+
+  // A shallow clone is a real, detectable state — say so rather than inferring
+  // it from "I found nothing".
+  let shallow = false;
+  try { shallow = git('rev-parse', '--is-shallow-repository').trim() === 'true'; } catch { /* old git */ }
+
+  for (const rev of revs) {
     let blob;
     try { blob = git('show', `${rev}:${path}`); } catch { continue; }
-    if (!blob.includes(sentinel)) return rev.trim();
+    if (!blob.includes(sentinel)) return { ref: rev, reason: null };
   }
+
+  if (shallow || revs.length < 2) {
+    return {
+      ref: null,
+      reason: `no pre-change version reachable: ${revs.length} commit(s) touching ${path}` +
+              `${shallow ? ', and this is a shallow clone' : ''}. The control assertions are SKIPPED, ` +
+              'not passed. Give the checkout full history (fetch-depth: 0) to run them.'
+    };
+  }
+
   throw new Error(
-    `every recent commit touching ${path} already contains ${JSON.stringify(sentinel)}. ` +
-    'A control that cannot find the pre-change code must fail rather than grade the new code twice.'
+    `every one of the ${revs.length} commits touching ${path} already contains ` +
+    `${JSON.stringify(sentinel)}, in a repository with full history. A control that cannot find ` +
+    'the pre-change code must fail rather than grade the new code twice — check the sentinel.'
   );
 }
 
 const NOW = toolsFrom(readFileSync(new URL(INDEX, repo), 'utf8'), 'working tree');
-const BASE_REF = baseRefWithout(INDEX, SENTINEL);
-const BEFORE = toolsFrom(
-  execFileSync('git', ['show', `${BASE_REF}:${INDEX}`], { cwd: repo, encoding: 'utf8' }),
-  `base ${BASE_REF.slice(0, 8)}`
-);
+
+const { ref: BASE_REF, reason: NO_BASE } = resolveBase(INDEX, SENTINEL);
+const BEFORE = BASE_REF
+  ? toolsFrom(execFileSync('git', ['show', `${BASE_REF}:${INDEX}`], { cwd: repo, encoding: 'utf8' }),
+              `base ${BASE_REF.slice(0, 8)}`)
+  : null;
+
+if (NO_BASE) console.error(`# CONTROL SKIPPED: ${NO_BASE}`);
+
+// Every assertion about the OLD literal goes through this, so a skipped control
+// is visibly skipped in the output of each test that wanted it, rather than the
+// test quietly asserting one thing less than it says it does.
+// For a test that asserts BOTH the new wording and the old: the new half always
+// runs, and the old half runs only when the control exists. `was(...)` makes
+// that explicit at each call site rather than hiding it in a conditional.
+function was(fn) {
+  if (BEFORE) fn(BEFORE);
+}
+
+function control(name, fn) {
+  test(name, (t) => {
+    if (!BEFORE) return t.skip(`no pre-change literal available — ${NO_BASE}`);
+    return fn();
+  });
+}
 
 const desc = (m, name) => String(m.get(name)?.description || '');
 const prop = (m, name, key) => String(m.get(name)?.inputSchema?.properties?.[key]?.description || '');
 
-test('sanity: the control really is the pre-change literal', () => {
+control('sanity: the control really is the pre-change literal', () => {
   assert.doesNotMatch(desc(BEFORE, 'log_time'), /MEASURED/,
     `the base at ${BASE_REF.slice(0, 8)} already says MEASURED, so it is not a control`);
 });
@@ -85,8 +146,10 @@ test('crit4: log_time says MEASURED time, and not the old "time spent" framing',
     'the exact sentence the reporting session cited as misleading must be gone');
 
   // the control: it said precisely that, and said nothing about measurement
-  assert.match(desc(BEFORE, 'log_time'), /^Log time spent on a task\./);
-  assert.doesNotMatch(desc(BEFORE, 'log_time'), /estimated_minutes/);
+  was((B) => {
+    assert.match(desc(B, 'log_time'), /^Log time spent on a task\./);
+    assert.doesNotMatch(desc(B, 'log_time'), /estimated_minutes/);
+  });
 });
 
 test('crit4: log_time sends estimates to estimated_minutes', () => {
@@ -100,12 +163,12 @@ test('crit4: log_time.minutes is described as measured and positive', () => {
   assert.match(p, /positive/i);
   assert.match(p, /estimated_minutes/);
   // control: "Number of minutes to log" — no provenance, no sign constraint
-  assert.doesNotMatch(prop(BEFORE, 'log_time', 'minutes'), /MEASURED|estimate/i);
+  was((B) => assert.doesNotMatch(prop(B, 'log_time', 'minutes'), /MEASURED|estimate/i));
 });
 
 test('crit4: log_time points the caller at start_working / stop_working instead', () => {
   assert.match(desc(NOW, 'log_time'), /stop_working/);
-  assert.doesNotMatch(desc(BEFORE, 'log_time'), /stop_working/);
+  was((B) => assert.doesNotMatch(desc(B, 'log_time'), /stop_working/));
 });
 
 test('crit4: log_time states both refusals, so a model is not surprised by them', () => {
@@ -118,7 +181,7 @@ test('crit4: quick_log says measured, and separates the estimate', () => {
   const d = desc(NOW, 'quick_log');
   assert.match(d, /MEASURED/);
   assert.match(d, /estimated_minutes/);
-  assert.doesNotMatch(desc(BEFORE, 'quick_log'), /MEASURED|estimated_minutes/);
+  was((B) => assert.doesNotMatch(desc(B, 'quick_log'), /MEASURED|estimated_minutes/));
 });
 
 test('crit4: quick_log GAINS an estimated_minutes argument, so its own code can stop conflating them', () => {
@@ -129,7 +192,7 @@ test('crit4: quick_log GAINS an estimated_minutes argument, so its own code can 
 
   // The defect in the control is in its code, not only its text: it hardcoded
   // estimated_minutes to `minutes`. Assert the property simply did not exist.
-  assert.equal(BEFORE.get('quick_log').inputSchema.properties.estimated_minutes, undefined);
+  was((B) => assert.equal(B.get('quick_log').inputSchema.properties.estimated_minutes, undefined));
 });
 
 test('crit1: stop_working says IT logs the time, and that the caller types no number', () => {
@@ -139,8 +202,8 @@ test('crit1: stop_working says IT logs the time, and that the caller types no nu
   assert.match(d, /Do NOT call log_time afterwards/);
   assert.match(d, /rounds to zero/i, 'the sub-minute case must be stated, or it reads as a lost measurement');
 
-  assert.doesNotMatch(desc(BEFORE, 'stop_working'), /log_time/,
-    'the control never mentioned the ledger at all — it reported a duration and stopped');
+  was((B) => assert.doesNotMatch(desc(B, 'stop_working'), /log_time/,
+    'the control never mentioned the ledger at all — it reported a duration and stopped'));
 });
 
 test('crit1: start_working names stop_working as the thing that logs', () => {

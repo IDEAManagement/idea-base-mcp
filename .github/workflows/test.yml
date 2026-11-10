@@ -27,6 +27,21 @@ jobs:
       # SHAs reused from .github/workflows/publish.yml rather than recalled, so
       # this workflow pins exactly what the repository already trusts.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Full history, NOT the default fetch-depth: 1.
+          #
+          # src/tools-time.test.js asserts each time-tool description against
+          # the version BEFORE the change, resolved by walking the file's
+          # history — the control that makes those assertions evidence rather
+          # than restatement. On a depth-1 clone there is nothing to walk, so
+          # the suite reports the control as SKIPPED (loudly, never as a pass)
+          # and the one thing CI would most want to check is the one thing it
+          # could not. Measured: with full history 12 of 12 run; on a shallow
+          # clone 11 run and 1 skips.
+          #
+          # Nothing else here needs history, so if the control is ever removed
+          # this can go back to the default.
+          fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # The package's own floor is >=20. Testing on it rather than on
