@@ -48,6 +48,26 @@ claude mcp add idea-base -- npx -y @idea-base/mcp-server \
   --env IDEA_BASE_API_KEY=ib_your_api_key_here
 ```
 
+### Or: install as a Claude Code plugin
+
+This repo also ships a plugin manifest (`.claude-plugin/plugin.json`) so Claude Code
+can load the server as a plugin instead of a hand-edited MCP config entry. It is not
+yet published to Anthropic's plugin directory — load it straight from the repo:
+
+```bash
+# one session only
+claude --plugin-dir /path/to/your/clone/idea-base-mcp
+
+# or add the repo as a local marketplace and install it persistently
+claude plugin marketplace add /path/to/your/clone/idea-base-mcp
+claude plugin install idea-base
+```
+
+The first time the plugin runs, Claude Code prompts for the **IDEA Base API key**
+(the manifest's one `userConfig` field) and stores it in its secure credential
+store — not in `settings.json` and not in this repo. Validate the manifest itself
+with `claude plugin validate .` from the repo root.
+
 ### 3. Start using it
 
 Ask Claude to manage your projects:
