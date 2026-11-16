@@ -1,0 +1,36 @@
+{
+  "name": "idea-base",
+  "version": "2.10.0",
+  "description": "MCP server for IDEA Base — AI-powered project management. Manage projects, tasks, time tracking and sprints directly from Claude Code.",
+  "author": {
+    "name": "IDEA Management LLC",
+    "url": "https://idea-base.us"
+  },
+  "homepage": "https://idea-base.us",
+  "repository": "https://github.com/IDEAManagement/idea-base-mcp",
+  "license": "MIT",
+  "keywords": [
+    "project-management",
+    "task-management",
+    "time-tracking",
+    "idea-base"
+  ],
+  "userConfig": {
+    "idea_base_api_key": {
+      "type": "string",
+      "title": "IDEA Base API key",
+      "description": "API key from IDEA Base — sign in at https://app.idea-base.us, then Settings > API Keys to create one.",
+      "required": true,
+      "sensitive": true
+    }
+  },
+  "mcpServers": {
+    "idea-base": {
+      "command": "npx",
+      "args": ["-y", "@idea-base/mcp-server@latest"],
+      "env": {
+        "IDEA_BASE_API_KEY": "${user_config.idea_base_api_key}"
+      }
+    }
+  }
+}
