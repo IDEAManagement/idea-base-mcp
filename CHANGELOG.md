@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.12.0 — 2026-11-17
+
+**The GitHub Action no longer fabricates time or guesses the task id.** Tracks
+[idea-base.us#499](https://github.com/IDEAManagement/idea-base.us/issues/499) /
+task 991118, found by the idea-base.us#496 review (F2, F3).
+
+### Fixed
+
+- **F2 — fabricated time.** `action.yml` derived 30-240 "minutes" from a PR's
+  line count and POSTed it to the task time-entry endpoint as a real logged
+  entry — exactly what idea-base.us#455 / task #990998 banned, from an action
+  that authenticates as the key owner and so was never blocked. The action now
+  only ever marks a task `done`; it has no time-logging action at all.
+- **F3 — guessed task id, unescaped body.** The action took the first `#\d+`
+  in the PR title as the IDEA Base task id, so a title like "Fix #123" (a
+  GitHub issue number) would mark task 123 done. `task-id` is now a required
+  action input, set explicitly by the caller — the PR title is never parsed
+  for it. The request body is now built with `JSON.stringify`, so a title
+  containing quotes can no longer break it (the old bash spliced the title
+  into a JSON literal unescaped).
+
+The decision logic moved out of `action.yml`'s inline bash into
+`src/github-action.js`, covered by `src/github-action.test.js` — bash in a
+composite action step cannot be unit tested without a shell harness this
+package does not have.
+
 ## 2.11.0 — 2026-11-17
 
 **A session stops claiming a task it already finished.** Re-vendors
