@@ -1,5 +1,69 @@
 # Changelog
 
+## 2.11.0 — 2026-11-17
+
+**A session stops claiming a task it already finished.** Re-vendors
+`heartbeat.sh` from `idea-base.us@4c842e5`. Tracks
+[idea-base.us#477](https://github.com/IDEAManagement/idea-base.us/issues/477)
+/ task 990931. No code in this package changed; the shipped hook did.
+
+### Fixed
+
+- **The anchor never ended.** `hb_anchor_from_transcript` matched only
+  `start_working` / `resume_working`, so a later `stop_working` was not a token
+  it could see, and `tail -n 1` pinned the last *start* for the rest of the
+  session. A session that finished a task went on asserting that task once a
+  minute while it carried on working — and because the board selects
+  `in_progress`, every one of those heartbeats was recorded and then filtered
+  away. An actively working session read as "Nothing is being worked on".
+
+  Measured upstream before the fix: **72 of the 87 rows (83%)** in
+  `session_heartbeats` anchored to a task that was already `done`, across 38
+  distinct tasks; one hub had posted 238 pings against a task closed eleven
+  days earlier.
+
+  The rule is now **ordering, not tool identity** — the last of
+  start / resume / stop / pause wins. A stopped anchor refuses out loud with
+  `result=NOT_SENT reason=anchor_stopped` and names the fix the session itself
+  can perform, which is a deliberately different refusal from `no_anchor`:
+  "I never said anything" and "I said I finished" need different remedies.
+
+  **`SessionEnd` is excluded and still posts**, against that same task. That is
+  not an oversight to tidy away later: the terminal event is the only thing
+  that takes a session *off* the board, and a session that calls `stop_working`
+  before exiting is the well-behaved case. Refusing there would have left every
+  tidy session on the board forever.
+
+### Added
+
+- **`result=ANCHOR_CLOSED`.** The heartbeat endpoint now answers
+  `anchor_closed` directly, and the hook traces it when a ping lands against a
+  task that is `done` — recorded, never silently absorbed. The hook does not
+  carry its own copy of which statuses count as closed; a hook and a server
+  disagreeing about that is the defect above in miniature.
+
+  This one classification is logged even when no operator switched tracing on,
+  which is an exception to the hook's "absence is silent" rule and a narrow
+  one: it is a persistent *state* rather than one sample of a signal, and the
+  session reading it can fix it by calling `start_working` on what it is
+  actually doing. It lands in the file `heartbeat-doctor.sh` already reads.
+
+- **The detached ping reads its own response.** Previously `output =
+  "/dev/null"`, so a server that declined politely was indistinguishable from
+  one that accepted. The body now goes to a file the detached child reads after
+  `curl` returns; nothing is added to the foreground path, and the hook still
+  cannot block the agent.
+
+- **`ANCHOR_STOPPED` in `resolve` output**, so a diagnostic can tell "working on
+  task N" from "finished task N and started nothing" — identical from outside,
+  and only one of them is a problem.
+
+### Note
+
+`2.10.0` shipped without a CHANGELOG section. That gap is left as it is rather
+than filled in from guesswork after the fact.
+
+
 ## 2.9.1 — 2026-11-07
 
 ### Fixed

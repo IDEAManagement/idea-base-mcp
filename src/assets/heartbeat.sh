@@ -212,6 +212,9 @@ fi
 # the task id. Nothing needs inferring.
 ISSUE=""
 ANCHOR_SRC=""
+# Non-empty (`stop` or `pause`) when the session's most recent declaration was
+# the END of a piece of work rather than the start of one. #477.
+ANCHOR_STOPPED=""
 
 # The GitHub issue number, EXPLICIT ONLY. A four-hop anchor: the endpoint
 # resolves it through `tasks.github_issue_id`, which holds repo-local numbers
@@ -335,10 +338,39 @@ fi
 # changed. Taking the FIRST would pin the row to work that has finished;
 # refusing when there is more than one would discard a fact the session gave us.
 #
-# `stop_working` deliberately does NOT clear it. The terminal `SessionEnd`
-# heartbeat is what takes a session off the board (#409), so a session that
-# tidied up before exiting must still be able to say it is gone — against the
-# task it was last working on.
+# `stop_working` ENDS THE ANCHOR FOR EVERY EVENT BUT THE TERMINAL ONE. #477.
+#
+# This used to say that `stop_working` "deliberately does NOT clear it", full
+# stop, and that was too broad by exactly one event. The reason given was
+# sound and still is: the terminal `SessionEnd` heartbeat is what takes a
+# session off the board (#409), so a session that tidied up before exiting
+# must still be able to say it is gone — against the task it was last working
+# on. But that argument only ever justified keeping the anchor for `stop`. It
+# was applied to `tool` as well, and there it means a session goes on
+# asserting a task it has explicitly finished, once a minute, for as long as
+# it keeps working.
+#
+# MEASURED, production, 2026-11-17: 72 of the 87 rows in `session_heartbeats`
+# anchor to a task that is `done` — 83%. The BuyingBuddy hub had posted 238
+# pings against task 990926, closed eleven days earlier. The board selects
+# `in_progress`, so every one of those pings was recorded and then filtered
+# away, and a demonstrably live session read as "Nothing is being worked on".
+#
+# So the rule is now ORDERING, not tool identity: the LAST of
+# start_working / resume_working / stop_working / pause_working wins.
+#
+#   * last record is start/resume -> that task is the anchor. Unchanged.
+#   * last record is stop/pause   -> the session has said it is not working on
+#     anything. A `tool` or `start` event refuses, out loud,
+#     `result=NOT_SENT reason=anchor_stopped` — the same shape as every other
+#     refusal here, because "I finished and have not started anything else" is
+#     a true answer and a guess would not be.
+#   * ...EXCEPT `stop`, which still posts, against that same task. That is
+#     #409's requirement and it is untouched: the one event that takes a
+#     session OFF the board must never be the one that cannot name its task.
+#
+# The two halves are tested against each other in tests/test-heartbeat-anchor.sh
+# — a fix for either that broke the other would pass only one of them.
 #
 # THE MATCH IS ANCHORED ON BOTH THE TOOL NAME AND ITS `task_id` INPUT, and that
 # is load-bearing. A transcript also contains the harness's list of AVAILABLE
@@ -347,12 +379,36 @@ fi
 # record is what separates a call from a mention. Measured against a live
 # transcript: the id occurs both as a JSON number and as a quoted string, so
 # both forms are accepted.
+#
+# RETURNS `<verb> <task_id>` — e.g. `start 990931` or `stop 990931` — and the
+# empty string when the session has declared nothing. The verb is returned
+# rather than resolved in here because the two callers want different things
+# from the same record: a `tool` event wants to know whether to refuse, and a
+# `stop` event wants the task id either way.
 hb_anchor_from_transcript() {
   [ -n "$1" ] || return 0
   [ -f "$1" ] || return 0
-  grep -oE '"name":"(mcp__[A-Za-z0-9_-]+__)?(start_working|resume_working)","input":\{[^}]*"task_id":"?[0-9]+' "$1" 2>/dev/null \
-    | sed -n 's/.*"task_id":"\{0,1\}\([0-9][0-9]*\)$/\1/p' \
+  grep -oE '"name":"(mcp__[A-Za-z0-9_-]+__)?(start_working|resume_working|stop_working|pause_working)","input":\{[^}]*"task_id":"?[0-9]+' "$1" 2>/dev/null \
+    | sed -n 's/.*"name":"\(mcp__[A-Za-z0-9_-]*__\)\{0,1\}\([a-z]*\)_working".*"task_id":"\{0,1\}\([0-9][0-9]*\)$/\2 \3/p' \
     | tail -n 1
+}
+
+# Split that into the two values the rest of the script uses. Sets TASK_ID and
+# ANCHOR_STOPPED; leaves both alone when there is no record at all.
+#
+# `${rec% *}` / `${rec#* }` rather than cut: two fewer subprocesses on a path
+# that runs once a minute per session and once per subagent tool call.
+hb_apply_anchor_record() {
+  case "$1" in
+    'start '*|'resume '*)
+      TASK_ID="${1#* }"
+      ANCHOR_STOPPED=""
+      ANCHOR_SRC="start_working declared in this session's transcript" ;;
+    'stop '*|'pause '*)
+      TASK_ID="${1#* }"
+      ANCHOR_STOPPED="${1% *}"
+      ANCHOR_SRC="${1% *}_working declared in this session's transcript — the anchor has ENDED" ;;
+  esac
 }
 
 HB_STATE="$HB_STATE_DIR/$(printf '%s' "$SESSION_ID" | cksum | cut -d' ' -f1).anchor"
@@ -373,13 +429,25 @@ if [ -z "$TASK_ID" ] && [ -n "$TRANSCRIPT" ]; then
   if [ -f "$HB_STATE" ] && [ ! "$TRANSCRIPT" -nt "$HB_STATE" ]; then
     TASK_ID=$(sed -n 's/^TASK_ID=\([0-9][0-9]*\)$/\1/p' "$HB_STATE" 2>/dev/null | head -n 1)
     if [ -n "$TASK_ID" ]; then
-      ANCHOR_SRC="start_working declared in this session's transcript (cached)"
-      hb_trace "anchor=recovered_from_cache task=$TASK_ID issue=${ISSUE:-<none>} transcript_present=$([ -f "$TRANSCRIPT" ] && echo yes || echo no)"
+      # THE STOPPED FLAG IS CACHED WITH THE TASK ID, NOT RE-DERIVED. #477.
+      #
+      # It has to be, and this is the subtle half of the fix. The scan is
+      # skipped whenever the cache is at least as new as the transcript, so on
+      # a `tool` ping inside the throttle window the ONLY thing that knows the
+      # anchor ended is this file. Reading back the id without the flag would
+      # resurrect a stopped anchor on the very next event and the refusal
+      # below would fire only on the one ping that happened to re-scan.
+      ANCHOR_STOPPED=$(sed -n 's/^STOPPED=\(.*\)$/\1/p' "$HB_STATE" 2>/dev/null | head -n 1)
+      if [ -n "$ANCHOR_STOPPED" ]; then
+        ANCHOR_SRC="${ANCHOR_STOPPED}_working declared in this session's transcript — the anchor has ENDED (cached)"
+      else
+        ANCHOR_SRC="start_working declared in this session's transcript (cached)"
+      fi
+      hb_trace "anchor=recovered_from_cache task=$TASK_ID issue=${ISSUE:-<none>} stopped=${ANCHOR_STOPPED:-no} transcript_present=$([ -f "$TRANSCRIPT" ] && echo yes || echo no)"
     fi
   fi
   if [ -z "$TASK_ID" ]; then
-    TASK_ID=$(hb_anchor_from_transcript "$TRANSCRIPT")
-    [ -n "$TASK_ID" ] && ANCHOR_SRC="start_working declared in this session's transcript"
+    hb_apply_anchor_record "$(hb_anchor_from_transcript "$TRANSCRIPT")"
   fi
 fi
 
@@ -406,8 +474,8 @@ fi
 # resolving `tool` ping is the earliest moment there is anything true to keep.
 if [ "$EVENT" != "resolve" ] && { [ -n "$TASK_ID" ] || [ -n "$ISSUE" ]; }; then
   mkdir -p "$HB_STATE_DIR" 2>/dev/null
-  printf 'TASK_ID=%s\nISSUE=%s\nSPOKE=%s\nSOURCE=%s\nSESSION_ID=%s\n' \
-    "$TASK_ID" "$ISSUE" "$SPOKE" "${ANCHOR_SRC:-unrecorded}" "$SESSION_ID" > "$HB_STATE" 2>/dev/null
+  printf 'TASK_ID=%s\nISSUE=%s\nSPOKE=%s\nSOURCE=%s\nSESSION_ID=%s\nSTOPPED=%s\n' \
+    "$TASK_ID" "$ISSUE" "$SPOKE" "${ANCHOR_SRC:-unrecorded}" "$SESSION_ID" "$ANCHOR_STOPPED" > "$HB_STATE" 2>/dev/null
   cp "$HB_STATE" "$HB_PROJECT_STATE" 2>/dev/null
 fi
 
@@ -420,6 +488,34 @@ fi
 # find it, and names the two things that fix it.
 if [ -z "$TASK_ID" ] && [ -z "$ISSUE" ] && [ "$EVENT" != "resolve" ]; then
   hb_trace "result=NOT_SENT reason=no_anchor detail=no-start_working-call-found-in-this-session-and-IDEABASE_TASK_ID-unset fix=call-start_working-or-set-IDEABASE_TASK_ID transcript=${TRANSCRIPT:-<none>} dir=$SPOKE session=$SESSION_ID"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# THE ANCHOR ENDED. REFUSE — BUT NOT FOR THE TERMINAL EVENT. #477 criterion 1.
+# ---------------------------------------------------------------------------
+# The session's most recent declaration was `stop_working` or `pause_working`,
+# so it is not working on that task any more and has not said what it IS
+# working on. There is nothing truthful to post, and the pre-#477 behaviour —
+# re-asserting the finished task once a minute — is what put 238 pings on a
+# task closed eleven days earlier.
+#
+# This is a REFUSAL, in the same shape and for the same reason as `no_anchor`
+# above: silence is detectable, a wrong row is not. The fix it names is the
+# one the session can actually perform.
+#
+# `stop` is EXCLUDED, and that exclusion is #409's requirement rather than a
+# convenience. `SessionEnd` is the only event that takes a session off the
+# board, it fires exactly once, and a lost one is indistinguishable from a
+# session that never ended. A spoke that tidies up — `stop_working`, then
+# exits, which is the NORMAL ordering for a well-behaved run — must still be
+# able to say it is gone, against the task it was last working on. Refusing
+# here would have made the tidy exit the one that leaks a row forever.
+#
+# `resolve` is excluded too: it posts nothing, and reporting the stopped state
+# is exactly what it is for.
+if [ -n "$ANCHOR_STOPPED" ] && [ "$EVENT" != "stop" ] && [ "$EVENT" != "resolve" ]; then
+  hb_trace "result=NOT_SENT reason=anchor_stopped detail=last-declaration-was-${ANCHOR_STOPPED}_working-on-task-$TASK_ID fix=call-start_working-on-the-task-you-are-working-on-now task=$TASK_ID dir=$SPOKE session=$SESSION_ID"
   exit 0
 fi
 
@@ -532,6 +628,7 @@ if [ "$EVENT" = "resolve" ]; then
     ISSUE=$(sed -n 's/^ISSUE=\([0-9][0-9]*\)$/\1/p' "$HB_PROJECT_STATE" 2>/dev/null | head -n 1)
     CACHED_SRC=$(sed -n 's/^SOURCE=\(.*\)$/\1/p' "$HB_PROJECT_STATE" 2>/dev/null | head -n 1)
     CACHED_SESSION=$(sed -n 's/^SESSION_ID=\(.*\)$/\1/p' "$HB_PROJECT_STATE" 2>/dev/null | head -n 1)
+    ANCHOR_STOPPED=$(sed -n 's/^STOPPED=\(.*\)$/\1/p' "$HB_PROJECT_STATE" 2>/dev/null | head -n 1)
     if [ -n "$TASK_ID" ] || [ -n "$ISSUE" ]; then
       ANCHOR_SRC="${CACHED_SRC:-unrecorded} — as last resolved by session ${CACHED_SESSION:-<unknown>}"
     fi
@@ -540,6 +637,10 @@ if [ "$EVENT" = "resolve" ]; then
   printf 'TASK_ID=%s\n' "$TASK_ID"
   printf 'ISSUE=%s\n' "$ISSUE"
   printf 'ANCHOR_SOURCE=%s\n' "$ANCHOR_SRC"
+  # #477: the doctor has to be able to tell "working on task N" from "finished
+  # task N and has not started anything else", because those look identical
+  # from the outside and only one of them is a problem.
+  printf 'ANCHOR_STOPPED=%s\n' "${ANCHOR_STOPPED:-no}"
   printf 'SPOKE=%s\n' "$SPOKE"
   printf 'ACTOR=%s\n' "${HB_ACTOR:-<unset — heartbeats will attribute to the API key owner, a human>}"
   printf 'API_KEY=%s\n' "$([ -n "$HB_KEY" ] && echo present || echo ABSENT)"
@@ -664,8 +765,26 @@ BODY=$(printf '{"event":"%s","session_id":"%s"%s%s,"spoke":"%s"}' \
 #
 # Neither value can contain a newline (the issue is digits, the session id and
 # spoke name are single-line), which is the one thing this format cannot carry.
-CURL_CFG=$(printf 'url = "%s"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n%sdata = %s\nsilent\nmax-time = 10\noutput = "/dev/null"\n' \
-  "$HB_URL" "$HB_KEY" "$ACTOR_HEADER" "$BODY")
+# THE DETACHED PING NOW KEEPS ITS RESPONSE BODY. #477 criterion 2.
+#
+# `output = "/dev/null"` used to be here, and #409 already recorded what that
+# costs: a server that declines politely with a 202 is indistinguishable from
+# one that accepted, so the decline is thrown away. #409 fixed that for `stop`
+# by making it synchronous. It could not fix it for `tool`, because `tool` must
+# not block — rule 3 — and that is still true.
+#
+# But not blocking and not LOOKING are different things. The body goes to a
+# file and the DETACHED CHILD reads it after curl returns. The hook itself
+# still forks and exits; nothing is added to the foreground path except the
+# name of a file. The directory already exists — the anchor cache above
+# mkdir -p's it on every event that resolved an anchor, which is every event
+# that reaches this line.
+#
+# `$$` is this shell's pid, so two subagents' pings in the same second cannot
+# collide on the file, and the child removes it whatever happened.
+HB_PING_BODY="$HB_STATE_DIR/ping-body.$$"
+CURL_CFG=$(printf 'url = "%s"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n%sdata = %s\nsilent\nmax-time = 10\noutput = "%s"\n' \
+  "$HB_URL" "$HB_KEY" "$ACTOR_HEADER" "$BODY" "$HB_PING_BODY")
 
 # ===========================================================================
 # RULE 3, AMENDED: `start` AND `tool` DETACH. `stop` DOES NOT. #409 c1 + c5.
@@ -713,7 +832,41 @@ CURL_CFG=$(printf 'url = "%s"\nheader = "Authorization: Bearer %s"\nheader = "Co
 # still holds — the exit is 0 whatever happened.
 if [ "$EVENT" != "stop" ]; then
   hb_trace "phase=forking session=$SESSION_ID task=${TASK_ID:-<none>} issue=${ISSUE:-<none>} url=$HB_URL actor=${HB_ACTOR:-<none>}"
-  ( printf '%s' "$CURL_CFG" | setsid curl --config - ) >/dev/null 2>&1 &
+  (
+    printf '%s' "$CURL_CFG" | setsid curl --config -
+    # ---------------------------------------------------------------------
+    # ANCHOR_CLOSED IS LOGGED EVEN WHEN NOBODY ASKED FOR A LOG. #477 c2 + c4.
+    # ---------------------------------------------------------------------
+    # Rule 4 ("absence is silent") governs the throttled ping and is right
+    # there: one lost sample of a continuous signal changes nothing a reader
+    # can see, and taxing every tool call to record a success would be the
+    # wrong trade.
+    #
+    # `anchor_closed` is not that. It is a STATE, not a sample — once a task
+    # is done it stays done, so this condition holds for every remaining ping
+    # of the session — and it is ACTIONABLE by the session itself, which is
+    # criterion 4: the thing to do is call `start_working` on whatever is
+    # actually being worked on now. A condition that is both persistent and
+    # fixable must not require an operator to have switched on tracing
+    # beforehand to be discoverable, because the person who needs it is
+    # looking at a board that says nothing is being worked on.
+    #
+    # So this one classification gets the default log that `stop` uses —
+    # which is also where `scripts/heartbeat-doctor.sh` already reads
+    # `result=` lines from, so the doctor surfaces it with no extra wiring.
+    # Every other outcome of a `tool` ping stays silent unless asked for.
+    # Spaces stripped for the same reason as the terminal path's RESP_MATCH
+    # below: the glob is compact and the server's whitespace is not a
+    # guarantee.
+    _resp=$(head -c 400 "$HB_PING_BODY" 2>/dev/null | tr -d '\n\r ')
+    rm -f "$HB_PING_BODY" 2>/dev/null
+    case "$_resp" in
+      *'"anchor_closed":true'*)
+        HB_LOG="${IDEABASE_HEARTBEAT_LOG:-${TMPDIR:-/tmp}/ib-heartbeat/stop.log}"
+        hb_trace "result=ANCHOR_CLOSED recorded=true task=${TASK_ID:-<none>} session=$SESSION_ID dir=$SPOKE detail=the-anchor-task-is-done-this-session-shows-as-closed-but-alive fix=call-start_working-on-the-task-you-are-working-on-now"
+        ;;
+    esac
+  ) >/dev/null 2>&1 &
   exit 0
 fi
 
@@ -768,10 +921,34 @@ CURL_RC=$?
 RESP=$(head -c 400 "$STOP_BODY_FILE" 2>/dev/null | tr -d '\n\r')
 rm -f "$STOP_BODY_FILE" 2>/dev/null
 
+# CLASSIFY ON A SPACE-STRIPPED COPY; LOG THE VERBATIM ONE. #477.
+#
+# The `case` globs below are written compactly (`"recorded":true`) because
+# that is what `Response.json()` emits, and in production it is. But the
+# classification was therefore depending on the server's whitespace, which is
+# not a property anything guarantees — and this was MEASURED, not reasoned:
+# a local catcher built with python's `json.dumps` (which defaults to `": "`)
+# answered a perfectly well-formed `"anchor_closed": true` and the hook
+# recorded `result=NO_RESPONSE` while logging the successful body on the same
+# line. A classifier that disagrees with the evidence printed beside it is
+# worse than no classifier.
+#
+# One `tr` on a bounded string, and `resp=` in the trace is still byte-exact
+# so a reader is never shown a normalised body as if it were the wire format.
+RESP_MATCH=$(printf '%s' "$RESP" | tr -d ' ')
+
 # Classify, so a later grep finds the failure without parsing JSON. The three
 # outcomes a reader actually cares about are "the row exists", "the server
 # refused and said why", and "the request never completed".
-case "$RESP" in
+case "$RESP_MATCH" in
+  # #477 c2: ordered BEFORE the plain recorded:true arm, because a closed
+  # anchor is also a recorded one and the more specific fact is the useful
+  # one. `recorded=true` stays on the line so nothing is lost by the
+  # reordering and a grep for either still finds this row.
+  *'"anchor_closed":true'*)
+    hb_trace "result=ANCHOR_CLOSED recorded=true http=${HTTP_CODE:-none} session=$SESSION_ID task=${TASK_ID:-<none>} issue=${ISSUE:-<none>} reason=${STOP_REASON:-<none>} detail=session-ended-while-anchored-to-a-task-that-is-done resp=$RESP"
+    rm -f "$HB_STATE" 2>/dev/null
+    ;;
   *'"recorded":true'*)
     hb_trace "result=RECORDED http=${HTTP_CODE:-none} session=$SESSION_ID task=${TASK_ID:-<none>} issue=${ISSUE:-<none>} reason=${STOP_REASON:-<none>} resp=$RESP"
     # The session is accounted for; the cache has done its job.
