@@ -291,6 +291,30 @@ For AI agents, these leave a durable trail of *what was done and why* on each ta
 |------|-------------|
 | `report_bug` | File a bug report against IDEA Base itself through the existing Help Desk intake (`POST /api/tickets`, category `bug`) — not a second intake path. Staff see it in the Help Desk queue. A read-only API key is refused. |
 
+## GitHub Action
+
+`action.yml` marks an IDEA Base task `done` when a PR merges. It does nothing
+else — it never logs time (idea-base.us#455 / #499 banned fabricating a
+"minutes" value from PR size, and that is all the old version ever had to
+measure with) and it never guesses the task id from the PR title (a title's
+`#123` is routinely a GitHub issue number, not an IDEA Base task id).
+
+```yaml
+- uses: IDEAManagement/idea-base-mcp@v2.11.0
+  if: github.event.pull_request.merged == true
+  with:
+    api-key: ${{ secrets.IDEA_BASE_API_KEY }}
+    task-id: '991118' # look this up explicitly — never parsed from the PR title
+```
+
+| Input | Required | Description |
+|-------|----------|--------------|
+| `api-key` | Yes | IDEA Base API key |
+| `task-id` | Yes | The task to mark done. Resolve it yourself (e.g. from the issue the PR references) — this action never reads the PR title for it |
+| `action` | No | `mark_done` or `auto` (identical — both mark the task done; there is no time-logging action) |
+
+The logic lives in `src/github-action.js`, covered by `src/github-action.test.js`.
+
 ## Environment Variables
 
 | Variable | Required | Description |
