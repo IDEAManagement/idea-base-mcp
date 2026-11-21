@@ -1,5 +1,59 @@
 # Changelog
 
+## 2.13.0 — 2026-11-21
+
+**Agent users can be created and keyed over MCP.** Tracks
+[idea-base.us#526](https://github.com/IDEAManagement/idea-base.us/issues/526) /
+task 991212.
+
+CEO, 2026-11-21, verbatim: *"Any paid user should be able to. And they should be
+able to over the MCP/API."* Until now the only agent user in existence had been
+created by a hand-written database statement, because there was no endpoint and
+no tool for it.
+
+### Added
+
+- **Six tools:** `list_agents`, `create_agent`, `issue_agent_key`,
+  `list_agent_keys`, `revoke_agent_key`, `remove_agent`. Any human on a paid
+  plan creates their own agents; a free workspace is refused with
+  `AGENT_PLAN_UPGRADE_REQUIRED`. You may key and remove the agents you own, and
+  an account owner or admin may act on any agent in the workspace.
+- `create_agent` returns the id to set as `IDEA_BASE_AGENT_ID`, and says that an
+  agent with no key cannot act yet. An agent with neither is the likeliest way
+  to get a confusing `403` later.
+- `issue_agent_key` defaults to the **weaker** `read` scope, where the API's own
+  default is `read,write`. A tool call that does not say what a credential is
+  for should mint the lesser one.
+
+### Changed
+
+- `apiRequest` takes `declareAgent`, defaulting to **true** so every existing
+  tool is byte-identical in behaviour. The six tools above pass `false`, so they
+  do not send `X-On-Behalf-Of`.
+
+  **Why, since this is the one surprising line in the release.** That header
+  answers "who did this work?", and provisioning an agent is a *person* setting
+  up their own tooling with their own credential — no agent did it. The server
+  refuses a request that declares an agent actor for exactly these operations,
+  and this package declares `claude_ai` by default on every request, so without
+  the flag all six tools would `403` unconditionally.
+
+  It is not a way around that refusal. The refusal that actually bounds an agent
+  is on the stored `users.is_agent` column of the key's owner: an **agent-owned
+  key is still refused** by these endpoints and nothing here changes that. The
+  header is self-declared and optional, so it never was a boundary — it is a
+  statement, and the statement should be accurate.
+
+  `src/tools-agents.test.js` asserts the header is absent on all six AND present
+  on an ordinary tool, and that the opt-out has not spread past the one named
+  constant.
+
+### Requires
+
+- idea-base.us with `GET/POST /api/agents`, `DELETE /api/agents/:id` and
+  `api_keys` accepting `agent_user_id` (idea-base.us#526). Against an older
+  deployment the six tools return `404`.
+
 ## 2.12.0 — 2026-11-17
 
 **The GitHub Action no longer fabricates time or guesses the task id.** Tracks

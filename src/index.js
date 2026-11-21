@@ -5,7 +5,9 @@
  *
  * Provides Claude Code with tools to interact with IDEA Base project management.
  * Tools include: list_projects, list_tasks, get_task, create_task, update_task,
- * update_task_status, log_time, and listen for real-time events.
+ * update_task_status, log_time, agent-user provisioning (list_agents,
+ * create_agent, issue_agent_key, list_agent_keys, revoke_agent_key,
+ * remove_agent), and listen for real-time events.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -245,25 +247,52 @@ function parseJsonBody(text, response) {
   }
 }
 
+/**
+ * @param {string} endpoint
+ * @param {object} [options] - fetch options, plus:
+ * @param {boolean} [options.declareAgent=true] - send `X-On-Behalf-Of`.
+ *   Pass false ONLY for an operation a person performs on their own tooling
+ *   rather than work an agent did. See the note below.
+ */
 async function apiRequest(endpoint, options = {}) {
   const url = `${API_BASE_URL}${endpoint}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const { declareAgent = true, ...fetchOptions } = options;
 
   let response;
   try {
     response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       // A redirect could carry the Authorization header somewhere else. There
       // is no legitimate redirect on this API, so refuse rather than follow.
       redirect: 'error',
       signal: controller.signal,
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
-        'X-On-Behalf-Of': AGENT_ID,
+        // `X-On-Behalf-Of` answers "who did this work?", and for almost
+        // everything this server does the honest answer is the agent — hence
+        // the default.
+        //
+        // AGENT PROVISIONING IS THE EXCEPTION, and it is a truthfulness point
+        // rather than a permissions one (GH idea-base.us#526, task 991212).
+        // Creating an agent user, or issuing and revoking its API keys, is a
+        // PERSON setting up their own tooling with their own credential. No
+        // agent did that work, so claiming one did would be a false
+        // declaration — and the server, correctly, refuses a request that
+        // declares an agent actor for exactly these operations (criterion 4:
+        // "an agent cannot create agents or issue keys").
+        //
+        // So this is not a way around that refusal. The refusal that actually
+        // bounds an agent is the one on the STORED `users.is_agent` column of
+        // the key's owner: an agent-OWNED key is still refused by these
+        // endpoints and nothing here changes that. This header is self-declared
+        // and optional, so it never was a boundary — it is a statement, and the
+        // statement should be accurate.
+        ...(declareAgent ? { 'X-On-Behalf-Of': AGENT_ID } : {}),
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        ...options.headers,
+        ...fetchOptions.headers,
       },
     });
   } catch (error) {
@@ -1210,10 +1239,201 @@ const tools = [
       required: ['subject'],
     },
   },
+
+  // ── Agent users (idea-base.us GH #526, task 991212) ──────────────────────
+  //
+  // CEO, 2026-11-21, verbatim: "Any paid user should be able to. And they
+  // should be able to over the MCP/API."
+  //
+  // Every description below states the rule the SERVER enforces, so a model
+  // reading the tool list does not have to discover it by being refused:
+  // a paid plan is required, an agent identity cannot use these at all, and a
+  // person reaches their own agents plus any in the workspace if they are an
+  // account owner or admin.
+  {
+    name: 'list_agents',
+    description: 'List the agent users in your IDEA Base workspace, with each one\'s owner, its active and revoked key counts, when its keys were last used, and the next key expiry. Readable by any member. Each row carries is_mine and can_remove so you can tell which agents you may act on. The response also carries can_manage (may you create agents at all) and upgrade_required (true on a free plan).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'create_agent',
+    description: 'Create an agent user: a non-human identity that tools and AI sessions act as. It takes no seat, cannot sign in, has no password or usable email address, and everything it spends is charged to you as its owner. Requires a PAID plan — a free workspace is refused with upgrade_required. An agent identity cannot create another agent, so this fails if the server sees an agent-owned API key. Returns the new agent, including the id to use as X-On-Behalf-Of.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'A descriptive name for the agent, e.g. "Board Agent 1". Max 100 characters. The agent\'s id and email address are generated; you cannot choose them.',
+        },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'issue_agent_key',
+    description: 'Issue an API key OWNED BY an agent user. The full key is returned exactly once and only its hash is stored, so save it immediately — it cannot be retrieved again. You may key an agent you own; an account owner or admin may key any agent in the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent_user_id: {
+          type: 'string',
+          description: 'The agent\'s user id, as returned by create_agent or list_agents.',
+        },
+        name: {
+          type: 'string',
+          description: 'A descriptive name for the key, e.g. "Board session key".',
+        },
+        permissions: {
+          type: 'string',
+          enum: ['read', 'write', 'read,write'],
+          description: 'Key scope. Defaults to read. A read key is refused on every non-GET request, so an agent that must write needs read,write.',
+        },
+        expires_in_days: {
+          type: 'number',
+          description: 'Days until the key expires. Omit for a key that never expires.',
+        },
+      },
+      required: ['agent_user_id', 'name'],
+    },
+  },
+  {
+    name: 'list_agent_keys',
+    description: 'List the API keys belonging to an agent user — name, non-secret prefix, scope, last used, expiry and whether revoked. The key itself is never returned by this or any other call; it exists only in the one issue_agent_key response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent_user_id: {
+          type: 'string',
+          description: 'The agent\'s user id.',
+        },
+      },
+      required: ['agent_user_id'],
+    },
+  },
+  {
+    name: 'revoke_agent_key',
+    description: 'Revoke one of an agent\'s API keys. It stops authenticating immediately. This cannot be undone — issue a new key instead. You may revoke keys for an agent you own; an account owner or admin may revoke any in the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key_id: {
+          type: 'number',
+          description: 'The API key id, as returned by list_agent_keys.',
+        },
+      },
+      required: ['key_id'],
+    },
+  },
+  {
+    name: 'remove_agent',
+    description: 'Remove an agent user from the workspace. Every one of its API keys is revoked and it can no longer act, but its past work stays attributed to it — the identity is not deleted, so task history, time entries and audit rows keep their actor. You may remove an agent you own; an account owner or admin may remove any in the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent_user_id: {
+          type: 'string',
+          description: 'The agent\'s user id.',
+        },
+      },
+      required: ['agent_user_id'],
+    },
+  },
 ];
+
+// ── Agent-user handlers (idea-base.us GH #526, task 991212) ───────────────
+//
+// EVERY ONE passes `declareAgent: false`. See the long note in `apiRequest`:
+// provisioning an agent is a person acting on their own tooling, not work an
+// agent did, and the server refuses a request that declares an agent actor for
+// these operations. Omitting the header is the accurate declaration, not an
+// evasion — the refusal that bounds an agent is the one on the stored
+// `users.is_agent` column of the key's owner, which no header can affect.
+//
+// If one of these is ever copied for a non-provisioning operation, DROP the
+// flag: the default is to declare the agent, and it is the right default.
+const AGENT_PROVISIONING = { declareAgent: false };
+
+const agentToolHandlers = {
+  async list_agents() {
+    const data = await apiRequest('/agents', AGENT_PROVISIONING);
+    return textResult(data);
+  },
+
+  async create_agent({ name }) {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new Error('name is required');
+    }
+    const agent = await apiRequest('/agents', {
+      ...AGENT_PROVISIONING,
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    // The id is what a session puts in IDEA_BASE_AGENT_ID / X-On-Behalf-Of, and
+    // an agent with no key cannot do anything yet. Both are said plainly rather
+    // than left for the caller to infer from the JSON.
+    return textResult({
+      ...agent,
+      next_step: `Issue a key with issue_agent_key({ agent_user_id: "${agent.id}", name: "..." }). `
+        + `Set IDEA_BASE_AGENT_ID=${agent.id} in the session that should act as this agent.`,
+    });
+  },
+
+  async issue_agent_key({ agent_user_id, name, permissions, expires_in_days }) {
+    const key = await apiRequest('/api-keys', {
+      ...AGENT_PROVISIONING,
+      method: 'POST',
+      body: JSON.stringify({
+        agent_user_id,
+        name,
+        // The API's own default is 'read,write'. This defaults to 'read'
+        // instead: a tool call that does not say what a credential is for
+        // should mint the weaker one, and a caller that wants writes can ask.
+        permissions: permissions || 'read',
+        ...(expires_in_days === undefined ? {} : { expires_in_days }),
+      }),
+    });
+    return textResult(key);
+  },
+
+  async list_agent_keys({ agent_user_id }) {
+    const keys = await apiRequest(
+      `/api-keys?agent_user_id=${encodeURIComponent(agent_user_id)}`, AGENT_PROVISIONING);
+    return textResult(keys);
+  },
+
+  async revoke_agent_key({ key_id }) {
+    const result = await apiRequest(`/api-keys/${encodeURIComponent(key_id)}`, {
+      ...AGENT_PROVISIONING,
+      method: 'DELETE',
+    });
+    return textResult(result);
+  },
+
+  async remove_agent({ agent_user_id }) {
+    const result = await apiRequest(`/agents/${encodeURIComponent(agent_user_id)}`, {
+      ...AGENT_PROVISIONING,
+      method: 'DELETE',
+    });
+    return textResult(result);
+  },
+};
+
+/** The content envelope every handler in this file returns. */
+function textResult(payload) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2),
+      },
+    ],
+  };
+}
 
 // Tool implementation handlers
 const toolHandlers = {
+  ...agentToolHandlers,
+
   async list_projects({ parent_id, status }) {
     let endpoint = '/projects';
     const params = new URLSearchParams();
@@ -2052,7 +2272,7 @@ const server = new Server(
     // Kept in step with package.json by a test; it had drifted to 1.0.0 while
     // the package was at 2.5.0, so the version a client reported bore no
     // relation to the one installed.
-    version: '2.12.0',
+    version: '2.13.0',
   },
   {
     capabilities: {
