@@ -96,6 +96,33 @@ Ask Claude to manage your projects:
 | `get_sprint_cadence` | Read a product's sprint rhythm |
 | `set_sprint_cadence` | Set length, start weekday, carry-over, auto-open |
 
+### Agent users
+
+An agent user is a non-human identity your tools and AI sessions act as. It
+takes no seat, it cannot sign in, and everything it spends is charged to the
+person who owns it. **Requires a paid plan** — a free workspace is refused with
+`AGENT_PLAN_UPGRADE_REQUIRED`.
+
+| Tool | Description |
+|------|-------------|
+| `list_agents` | The workspace's agents, with owner, key counts, last use and next expiry. Each row says `is_mine` and `can_remove` |
+| `create_agent` | Create an agent owned by you. Returns the id to put in `IDEA_BASE_AGENT_ID` |
+| `issue_agent_key` | Issue an API key owned by an agent. Shown **once**; only its hash is stored |
+| `list_agent_keys` | An agent's keys — prefix, scope, last used, expiry, revoked. Never the key itself |
+| `revoke_agent_key` | Revoke one key. Immediate, and cannot be undone |
+| `remove_agent` | Revoke every key and drop the agent from the workspace. Its past work stays attributed to it |
+
+Who may do what: anyone on a paid plan creates their **own** agents. You may key
+and remove the agents you own; an account owner or admin may act on any agent in
+the workspace.
+
+**An agent cannot create agents or issue keys.** If this server is running on an
+API key that belongs to an agent user, these six tools are refused with `403`.
+That is the rule, not a misconfiguration — provisioning is a person's job. Note
+that the refusal is on the key's OWNER, so it does not depend on
+`IDEA_BASE_AGENT_ID`: these six tools deliberately do not send
+`X-On-Behalf-Of`, because setting up your own tooling is not work an agent did.
+
 ### Slash commands (MCP prompts)
 
 Typed directly in Claude Code. The `idea-base` part is whatever you named the
