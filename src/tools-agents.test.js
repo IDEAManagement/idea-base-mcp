@@ -42,7 +42,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repo = new URL('../', import.meta.url);
@@ -54,27 +54,63 @@ const AGENT_TOOLS = [
 ];
 
 // ── stage the real module ─────────────────────────────────────────────────
-// Staged in `src/` ITSELF, and both halves of that are load-bearing:
+// Staged in `src/` ITSELF, because index.js imports its own siblings relatively
+// (`./cli.js`, `./features.js`) and those only resolve from the directory it
+// actually lives in. Dot-prefixed so `node --test src/*.test.js` cannot pick
+// the copies up as suites, and both are removed on exit.
+const srcDir = join(fileURLToPath(repo), 'src');
+const stagedPath = join(srcDir, `.ib-agents-staged-${process.pid}.mjs`);
+const sdkStubPath = join(srcDir, `.ib-agents-sdk-stub-${process.pid}.mjs`);
+
+// THE SDK IS STUBBED, and that is required rather than convenient: `npm test`
+// in CI runs with NO node_modules installed (see .github/workflows/test.yml —
+// checkout, setup-node, `npm test`, and no install step), because every other
+// suite in this package reads index.js as TEXT and never imports it. An import
+// of the real `@modelcontextprotocol/sdk` therefore dies with
+// ERR_MODULE_NOT_FOUND in CI while passing locally, which is exactly how this
+// file first went red on its own PR.
 //
-//   * not the system temp dir — `src/index.js` imports
-//     `@modelcontextprotocol/sdk`, and Node resolves a bare specifier by
-//     walking up from the importing FILE. From /tmp that walk never reaches
-//     this package's node_modules (ERR_MODULE_NOT_FOUND).
-//   * not node_modules/.cache either — index.js also imports its own siblings
-//     relatively (`./cli.js`, `./features.js`), which only resolve from the
-//     directory it actually lives in.
-//
-// Dot-prefixed so `node --test src/*.test.js` cannot pick it up as a suite, and
-// removed on exit.
-const stagedPath = join(fileURLToPath(repo), 'src', `.ib-agents-staged-${process.pid}.mjs`);
+// Nothing under test touches the SDK. `main()` is stripped below, so no
+// transport is ever connected; `new Server(...)` and `setRequestHandler(...)`
+// run at import and must merely not throw. The six handlers and `apiRequest`
+// are the real shipped code.
+const SDK_STUB = `
+export class Server {
+  constructor() {}
+  setRequestHandler() {}
+  async connect() {}
+}
+export class StdioServerTransport {}
+export const CallToolRequestSchema = { method: 'tools/call' };
+export const ListToolsRequestSchema = { method: 'tools/list' };
+export const ListPromptsRequestSchema = { method: 'prompts/list' };
+export const GetPromptRequestSchema = { method: 'prompts/get' };
+export const ErrorCode = { InvalidRequest: -32600, MethodNotFound: -32601, InternalError: -32603 };
+export class McpError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+`;
+writeFileSync(sdkStubPath, SDK_STUB);
 
 const MAIN_CALL = /main\(\)\.catch\([\s\S]*?\}\);\s*$/;
 assert.ok(MAIN_CALL.test(SRC),
   'could not find the trailing main().catch(...) invocation — this stager is stale');
 
-const staged = SRC.replace(MAIN_CALL, 'export { apiRequest, toolHandlers, tools, AGENT_ID };\n');
+// Asserted rather than assumed: if the SDK import specifiers are ever changed,
+// the rewrite below silently stops applying and the suite goes red in CI only.
+const SDK_SPECIFIER = /'@modelcontextprotocol\/sdk\/[^']+'/g;
+assert.equal((SRC.match(SDK_SPECIFIER) || []).length, 3,
+  'expected exactly 3 @modelcontextprotocol/sdk imports in index.js — this stager is stale');
+
+const staged = SRC
+  .replace(MAIN_CALL, 'export { apiRequest, toolHandlers, tools, AGENT_ID };\n')
+  .replace(SDK_SPECIFIER, `'./${basename(sdkStubPath)}'`);
 writeFileSync(stagedPath, staged);
-process.on('exit', () => { try { rmSync(stagedPath, { force: true }); } catch { /* best effort */ } });
+process.on('exit', () => {
+  for (const p of [stagedPath, sdkStubPath]) {
+    try { rmSync(p, { force: true }); } catch { /* best effort */ }
+  }
+});
 
 // `src/index.js` exits the process when there is no API key, and resolves the
 // base URL and agent id at import. Both are set before the import so the module
